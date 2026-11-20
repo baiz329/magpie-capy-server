@@ -6,7 +6,7 @@
 
 A magpie provider plugin that connects [Capy](https://capy.ai) to [magpie](https://usemagpie.ai). Forked from [baijiu666/magpie-Capy](https://github.com/baijiu666/magpie-Capy), with Cookie login added for headless Linux servers: no desktop app, no graphical browser — paste two pieces of Cookie and sign in. 3 free models, native SSE streaming / non-streaming chat, image / PDF attachments.
 
-当前版本：**v0.2.1**（`package.json` 版本 `0.2.1`，对应 git tag `v0.2.1`；已发布 GitHub Release v0.2.1，未发布到 npm）。
+当前版本：**v0.2.2**（`package.json` 版本 `0.2.2`，对应 git tag `v0.2.2`；未发布 GitHub Release，未发布到 npm）。
 
 - **纯无头**：自动注册设备，走 Capy device tunnel；运行时不需要 Capy 桌面端。
 - **登录**：本机 Capy 客户端导入 / 浏览器登录 / 粘贴 Cookie 登录（无头服务器适用；两框分别粘贴，获取方法见下方登录说明）。
@@ -30,6 +30,22 @@ bun run build
 ## 登录
 
 支持三种方式：本机 Capy 客户端导入、浏览器登录，以及无头环境适用的粘贴 Cookie 登录（两框）。
+
+### 本机 Capy 客户端导入
+
+1. 先在本机装好 Capy 桌面端并登录一次（只需要登录过，登录时桌面端不用开着）。
+2. 在 Magpie 里选这个方式，插件会只读本机保存的 Capy 登录凭据（Windows 上是 `%APPDATA%\Capy` 下的 `Local State`），自动完成登录，不用复制任何东西。
+3. 如果这台机器上从来没在 Capy 桌面端登过录，会报“请先在 Capy 桌面端登录”，先去桌面端登一次再回来。
+
+注意：这个方式只在装了 Capy 桌面端的机器上能用（目前是 Windows）。无头 Linux 服务器上没有桌面端，**用下面的粘贴 Cookie 登录**。
+
+### 浏览器登录
+
+1. 在 Magpie 里选这个方式，插件会自动打开 Capy 官方登录页 `https://capy.ai/sign-in`（用本机 Chrome / Edge / Brave / Chromium）。
+2. 在打开的页面上用 Google、GitHub、Passkey 或邮箱登录 Capy。
+3. 登录成功后插件会自动读取登录态，**不需要复制任何东西**，等它完成就行；中途关掉浏览器等于取消登录。
+
+注意：这个方式需要图形浏览器。无头 Linux 服务器上没有图形浏览器，**用下面的粘贴 Cookie 登录**。
 
 ### 粘贴 Cookie 登录（两框）
 
@@ -58,7 +74,7 @@ bun run build
 
 ## 风险提示
 
-本插件通过你自己的 Clerk 会话直接调用 Capy 网站的聊天接口（逆向实现，不是 Capy 官方 API）。每一次调用都会在你的 Capy 账号里真实新建一个对话；请求格式高度一致、行为模式与正常网页使用不同，Capy 服务端可以识别出来。**存在被判定为非官方客户端并封号的风险，免费额度上尤其如此。**
+本插件通过你自己的 Clerk 会话直接调用 Capy 网站的聊天接口（逆向实现，不是 Capy 官方 API）。免费还是付费模型都走同一条接口（模型只是参数），没有单独的官方 API 对话通道；插件自动签发的 API Key 只用来拉模型列表、收流式消息、传附件和查用量，不用来直接调模型。每一次调用都会在你的 Capy 账号里真实新建一个对话；请求格式高度一致、行为模式与正常网页使用不同，Capy 服务端可以识别出来。**存在被判定为非官方客户端并封号的风险，免费额度上尤其如此。**
 
 建议：不要高频、批量调用；不要把它当作重度主力长期跑任务；轻量使用。是否使用请自行权衡。
 

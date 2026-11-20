@@ -4476,8 +4476,7 @@ function toMagpieModel(model, providerId, toolsEnabled) {
   return {
     id: model.id,
     providerID: providerId,
-    name: isAdsModel(model.id) ? `${model.name} \xB7 US/CA/UK/AU/NZ/IE` : model.name,
-    ...isAdsModel(model.id) ? { description: "Free with ads \u2014 only US / CA / UK / AU / NZ / IE egress IP" } : {},
+    name: model.name,
     free: model.free,
     tool_call: toolsEnabled,
     attachment: true,
