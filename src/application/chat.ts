@@ -38,6 +38,16 @@ interface JwtCacheEntry {
 
 const JWT_TTL_MS = 50_000;
 
+// Burst smoothing: Capy sometimes sends the full text in one frame; a single
+// huge delta makes downstream TPS explode (all tokens in ~0s) and magpie show
+// no speed. Split a large delta into small pieces with a short delay so the
+// stream looks gradual. Only applies to bursts; normal incremental deltas
+// pass through immediately. First piece goes out with no delay (TTFT unchanged).
+const PACE_THRESHOLD = 200; // code points; pace only deltas larger than this
+const PACE_CHUNK = 40; // code points per piece
+const PACE_DELAY_MS = 50; // ms between pieces
+const PACE_MAX_MS = 2000; // max total pacing time per delta
+
 export class ChatUseCase {
   private readonly options: ChatUseCaseOptions;
   private readonly jwtCache = new Map<string, JwtCacheEntry>();
@@ -102,7 +112,13 @@ export class ChatUseCase {
     const normalizer = new PublicSseNormalizer();
     try {
       for await (const frame of this.options.publicApi.streamThread(session.accessToken, thread.id, run.signal)) {
-        for (const event of normalizer.push(frame)) yield event;
+        for (const event of normalizer.push(frame)) {
+          if (event.type === "delta") {
+            yield* this.paceDelta(event.text, run.signal);
+          } else {
+            yield event;
+          }
+        }
       }
       if (!normalizer.text && !normalizer.hasError) {
         const failure = await this.jamFailure(jwt, session.orgId, thread.id, run.signal);
@@ -151,6 +167,29 @@ export class ChatUseCase {
       await this.options.app.interruptJam(jwt, session.orgId, jamId);
     } catch {
       // best-effort
+    }
+  }
+
+  private async *paceDelta(text: string, signal?: AbortSignal): AsyncIterable<ChatEvent> {
+    const points = Array.from(text);
+    if (points.length <= PACE_THRESHOLD) {
+      yield { type: "delta", text };
+      return;
+    }
+    const pieces: string[] = [];
+    for (let i = 0; i < points.length; i += PACE_CHUNK) {
+      pieces.push(points.slice(i, i + PACE_CHUNK).join(""));
+    }
+    let delay = PACE_DELAY_MS;
+    const total = (pieces.length - 1) * delay;
+    if (total > PACE_MAX_MS) {
+      delay = Math.floor(PACE_MAX_MS / (pieces.length - 1));
+    }
+    for (let i = 0; i < pieces.length; i++) {
+      if (i > 0 && delay > 0) {
+        await this.options.clock.sleep(delay, signal);
+      }
+      yield { type: "delta", text: pieces[i]! };
     }
   }
 

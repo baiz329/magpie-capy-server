@@ -126,7 +126,7 @@
 
 - **FR-4.1 请求**：OpenAI `messages`；system/developer 单独成块；单条 user 原样发送。
 - **FR-4.2 线程**：App API `POST /app/orgs/{org}/jams`，projectless + device + worktree。
-- **FR-4.3 流**：公共 API `/api/v1/threads/{id}/stream?until=run`；assistant 帧实时转发；transcript 校正。
+- **FR-4.3 流**：公共 API `/api/v1/threads/{id}/stream?until=run`；assistant 帧实时转发；transcript 校正；上游一次给全文的大段 delta（>200 字）会切成约 40 字一段平滑发出（首段立即发，段间约 50ms，总共不超过 2s），避免下游 TPS 失真。
 - **FR-4.4 流式输出**：OpenAI `chat.completion.chunk`；`finish_reason:"stop"`；`[DONE]`。
 - **FR-4.5 非流式**：返回完整 `chat.completion`。
 - **FR-4.6 取消**：客户端断开 → `POST /app/.../interrupt`。

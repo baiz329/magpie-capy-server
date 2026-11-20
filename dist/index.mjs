@@ -3713,6 +3713,10 @@ function parseJson(value) {
 
 // src/application/chat.ts
 var JWT_TTL_MS = 50000;
+var PACE_THRESHOLD = 200;
+var PACE_CHUNK = 40;
+var PACE_DELAY_MS = 50;
+var PACE_MAX_MS = 2000;
 
 class ChatUseCase {
   options;
@@ -3762,8 +3766,13 @@ class ChatUseCase {
     const normalizer = new PublicSseNormalizer;
     try {
       for await (const frame of this.options.publicApi.streamThread(session.accessToken, thread.id, run.signal)) {
-        for (const event of normalizer.push(frame))
-          yield event;
+        for (const event of normalizer.push(frame)) {
+          if (event.type === "delta") {
+            yield* this.paceDelta(event.text, run.signal);
+          } else {
+            yield event;
+          }
+        }
       }
       if (!normalizer.text && !normalizer.hasError) {
         const failure = await this.jamFailure(jwt, session.orgId, thread.id, run.signal);
@@ -3809,6 +3818,28 @@ class ChatUseCase {
       const jwt = await this.sessionJwt(session);
       await this.options.app.interruptJam(jwt, session.orgId, jamId);
     } catch {}
+  }
+  async* paceDelta(text, signal) {
+    const points = Array.from(text);
+    if (points.length <= PACE_THRESHOLD) {
+      yield { type: "delta", text };
+      return;
+    }
+    const pieces = [];
+    for (let i = 0;i < points.length; i += PACE_CHUNK) {
+      pieces.push(points.slice(i, i + PACE_CHUNK).join(""));
+    }
+    let delay = PACE_DELAY_MS;
+    const total = (pieces.length - 1) * delay;
+    if (total > PACE_MAX_MS) {
+      delay = Math.floor(PACE_MAX_MS / (pieces.length - 1));
+    }
+    for (let i = 0;i < pieces.length; i++) {
+      if (i > 0 && delay > 0) {
+        await this.options.clock.sleep(delay, signal);
+      }
+      yield { type: "delta", text: pieces[i] };
+    }
   }
   async sessionJwt(session, signal) {
     const key = `${accountKey(session)}:${session.clerk.sessionId}`;

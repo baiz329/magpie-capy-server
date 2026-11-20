@@ -129,6 +129,33 @@ test("ChatUseCase：ensure → createJam → SSE → 事件", async () => {
   expect(calls[0]?.clientKey).toBe(calls[0]?.requestId);
 });
 
+test("ChatUseCase：大段 delta 会被平滑切分（burst 不再一次发完）", async () => {
+  const big = "你好世界".repeat(60);
+  const { app } = fakeApp();
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: fakePublic([
+      sse("assistant", { callId: "c1", text: big }),
+      sse("done", {}),
+    ]),
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+
+  const events: unknown[] = [];
+  for await (const event of useCase.stream(session, request)) events.push(event);
+
+  const deltas = events.filter((e): e is { type: "delta"; text: string } => (e as { type: string }).type === "delta");
+  expect(deltas.length).toBeGreaterThan(1);
+  expect(deltas.map((d) => d.text).join("")).toBe(big);
+  for (const d of deltas) {
+    expect(Array.from(d.text).length).toBeLessThanOrEqual(40);
+  }
+});
+
 test("ChatUseCase：ADS 模型建线程带 ads 能力位", async () => {
   const { app, calls } = fakeApp();
   const useCase = new ChatUseCase({
