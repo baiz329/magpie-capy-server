@@ -1,0 +1,46 @@
+{
+  "name": "magpie-capy",
+  "version": "0.2.1",
+  "description": "Capy provider plugin for Magpie v0.2: headless device, three login methods including two-box Cookie login, native SSE, image/PDF attachments, zero runtime dependencies.",
+  "type": "module",
+  "main": "dist/index.mjs",
+  "exports": "./dist/index.mjs",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun build src/entry/plugin.ts --outfile dist/index.mjs --target bun --format esm",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "smoke": "bun run scripts/smoke.mjs"
+  },
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.0"
+  },
+  "keywords": [
+    "magpie",
+    "capy",
+    "provider",
+    "headless",
+    "sse"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "icon": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAEfklEQVR4nOxbi5HiMAx9u3eFsJVgOoFKMJUwV0lMJ1wlHAoROIo/ckic7N29GQ9rx0msZ0mW5exPLAfTlW33Szh1vxaV8BPLwN7LMdB+FH1mxwfqo8FrxlNw97LDzPhEXVgI4Y0xsNaG+lK/G3RkjUZNDbAQak+CH4+vpt1uB+ecvI8aZtOEWgRYZIRnfHwEh3TCTD6hFgE3vxITnkAaQJoQADU6xGH8x0CJGj7A9ioJ4QnkE6gE0HTPsn73rv3W/TZe3UKBuTTA4KHyRl643W7ZmxNa0OsGnYNMas7UGmDwmgUjL0a8/fAhYQ0IvUsD1pwgfmAamHs5dy/aBDvchTqfz9CCneFms2nL9XqN9uVn7/d7fH19hVYSg4e2Dy68awIGEVXngVHZbrfaWc3idHpEy6RN9EzyJ/LZkeW0vQRBwjsEWITD2ejAaiHhQxxETDGGAIPIrC8tuI9IPEHoaUGpE7QIODgSuGmatqxB+AyMXynZDUY9e2pdXwIR+2ds/YqWgOCsr0XdJS6Xi7qvxgcMhF/jrPtI2D+ht6/IacBA+LXbOS+TWqQI+HbCEzL233bxK7FVwOIbCk9QmKbzKyFjsRABzncRnpHwAYO8QsgEBomLWsKz+ko7Lg2nqZ/CFFpIAmyvUsnb02BJ6NiguV2riQkCtrLBJ8DCm31e5+cGCa7dJmtB2hKBkQ3RULiG2pcKP9GYjF/xvcUzVVND9UM7ttj2mfqWCq/dDLEJWCyMFOkTa6OBRwBnhBr/ZTJzQ6pKs0WsTjUYyvLwLHE2Z0pkIsJf/AeNwMAjQM6EVFXe+q4dCRNw8JIi1MvC8/6hrK182NpJyGSVHTwCVAkR6amVaevFULIdJif4XDRj9s0m4RNBJJBmUBt5bX4pByB+IFI7lM5EgT12iADDldQgQySE6iGQQ1oRAT2UpMSiJORQU3hFPsD5FfJuowKgTNalBQc2NbNHinH1OhRpACO0W/OFXGrrXDr7hB4BZDtjZmstyVGFaQ6WB1oGHQohncwahFfmAq1sGGiABn6/tQivmP0gQ5/yQo6Etc0+jUe5KrlQ4yASzKlSSZRVA0rVp04udIF9wPNiqQYksi+zI3EMLmFjF1gDejSmWF2DCfBeRCl8UkWYAAdPC8imYg/3BZ46l6fBCOFtqsOn6PyqRLSA4wROXdUEJ2YKYHMdZNzYOw5b0yFowaw/b4EixpEfSf2+lz1XeMu75FJHY6APn1IfSclb7uUAZYAnCbjiES7u/QEsQQK993A4lJ72Ojxm/qq9IbZ1shBHZLXSYLlTotStGPFRdep0eBAhkiaUnr9rwd59hK23t2PkF+WpnKBFYA0lxzglEW8KTqCBjE5Q5rMaie8B24tdLKBdLfwT4JECPx+FRIirhYYAgkWChF7HQHAUSpS+iWyAo4WWAKCAhBnhMMGs+yghgGFRnwiHiQVnjCGAYTE/EQ4zCc54hwCGxbREOMwstI8pCGAYDP8TNAfX/V4gdqS1MCUBIZhIu8NKMDcBq4fqdPhvxn8C8I/jDwAAAP//6w8I9gAAAAZJREFUAwDFTOemoPtiCAAAAABJRU5ErkJggg==",
+    "maxConcurrency": 2
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/baiz329/magpie-capy-server.git"
+  },
+  "homepage": "https://github.com/baiz329/magpie-capy-server#readme",
+  "bugs": {
+    "url": "https://github.com/baiz329/magpie-capy-server/issues"
+  }
+}
