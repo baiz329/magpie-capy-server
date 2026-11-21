@@ -8,7 +8,7 @@ import type {
   UploadedFile,
 } from "../../ports/capy-public.ts";
 import { decodeSseStream } from "../../protocol/sse.ts";
-import { requestJson } from "../platform/http.ts";
+import { fetchWith429Retry, MAX_429_RETRIES, requestJson } from "../platform/http.ts";
 import { CAPY_PUBLIC, publicHeaders } from "./endpoints.ts";
 
 function rawModels(items: unknown): RawModel[] {
@@ -86,14 +86,16 @@ export class CapyPublicClient implements CapyPublicPort {
     const url = `${CAPY_PUBLIC}/threads/${encodeURIComponent(threadId)}/stream?until=run`;
     let response: Response;
     try {
-      response = await this.fetchImpl(url, {
+      // 初始 GET 是幂等读：429 有界重试（最多 2 次，尊重 Retry-After）；
+      // 流一旦开始出数据就不再重试（见下方的 !response.ok → mapUpstream）。
+      response = await fetchWith429Retry(this.fetchImpl, url, {
         method: "GET",
         headers: {
           ...publicHeaders(apiKey),
           accept: "text/event-stream",
         },
         ...(signal ? { signal } : {}),
-      });
+      }, { maxRetries: MAX_429_RETRIES });
     } catch (error) {
       if (signal?.aborted) throw error;
       throw new CapyError("upstream_unavailable", `连接 Capy 流失败：${errorText(error)}`, { cause: error });

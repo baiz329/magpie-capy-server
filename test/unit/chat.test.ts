@@ -5,6 +5,7 @@ import { DeviceUseCase } from "../../src/application/device.ts";
 import { PromptToolBridge } from "../../src/application/tools.ts";
 import type { AccountSession } from "../../src/domain/account.ts";
 import type { ChatRequest } from "../../src/domain/chat.ts";
+import { CapyError } from "../../src/domain/errors.ts";
 import type { CapyAppPort, CreateJamInput, DeviceInfo, JamCreated } from "../../src/ports/capy-app.ts";
 import type { CapyPublicPort, UpstreamSseFrame } from "../../src/ports/capy-public.ts";
 import type { DeviceRuntimePort } from "../../src/ports/device-runtime.ts";
@@ -221,4 +222,98 @@ test("ChatUseCase：cancel 调 interrupt", async () => {
   });
   await useCase.cancel(session, "jam_1");
   expect(interrupted()).toBe(1);
+});
+
+test("ChatUseCase：建线程 429 直接抛 rate_limited，不静默降级", async () => {
+  const base = fakeApp();
+  const app: CapyAppPort = {
+    ...base.app,
+    async createJam(): Promise<JamCreated> {
+      throw new CapyError("rate_limited", "Capy 限流");
+    },
+  };
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: fakePublic([]),
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+  let caught: unknown = null;
+  try {
+    for await (const _event of useCase.stream(session, request)) { /* drain */ }
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(CapyError);
+  if (caught instanceof CapyError) {
+    expect(caught.kind).toBe("rate_limited");
+    expect(caught.status).toBe(429);
+    expect(caught.retryable).toBe(true);
+  }
+});
+
+test("ChatUseCase：建线程 401 直接抛 sign_in_required，不重试", async () => {
+  const base = fakeApp();
+  let calls = 0;
+  const app: CapyAppPort = {
+    ...base.app,
+    async createJam(): Promise<JamCreated> {
+      calls += 1;
+      throw new CapyError("sign_in_required", "Capy 登录已失效，请重新登录");
+    },
+  };
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: fakePublic([]),
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+  let caught: unknown = null;
+  try {
+    for await (const _event of useCase.stream(session, request)) { /* drain */ }
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(CapyError);
+  if (caught instanceof CapyError) {
+    expect(caught.kind).toBe("sign_in_required");
+    expect(caught.status).toBe(401);
+  }
+  expect(calls).toBe(1);
+});
+
+test("ChatUseCase：流开始前 429 只出一个 error 事件（rate_limited），前面没有 delta", async () => {
+  const { app } = fakeApp();
+  const throwingPublic: CapyPublicPort = {
+    async listModels() { return { items: [] }; },
+    async *streamThread(): AsyncIterable<UpstreamSseFrame> {
+      throw new CapyError("rate_limited", "Capy 限流");
+    },
+    async uploadFiles() { return []; },
+    async usage() { return {}; },
+    async balance() { return {}; },
+  };
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: throwingPublic,
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+  const events = [];
+  for await (const event of useCase.stream(session, request)) events.push(event);
+  expect(events).toHaveLength(1);
+  expect(events[0]?.type).toBe("error");
+  if (events[0]?.type === "error") {
+    expect(events[0].error.kind).toBe("rate_limited");
+    expect(events[0].error.status).toBe(429);
+  }
 });

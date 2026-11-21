@@ -1,5 +1,6 @@
 import { STATIC_CATALOG } from "../adapters/capy/static-catalog.ts";
 import { CapyAppClient } from "../adapters/capy/app-client.ts";
+import { createDesktopVersionProbe } from "../adapters/capy/client-version.ts";
 import { CapyLoginSources } from "../adapters/capy/browser-login.ts";
 import { combineCookieInputs, cookieCredentialOf } from "../adapters/capy/cookie-login.ts";
 import { HeadlessDeviceRuntime, FileSecretStore } from "../adapters/capy/device-tunnel.ts";
@@ -167,7 +168,7 @@ export default async function CapyNextPlugin(
     logger.event("proxy_enabled", { proxy: host });
   }
   const cache = new MemoryCache(() => clock.now());
-  const app = new CapyAppClient(fetchImpl);
+  const app = new CapyAppClient(fetchImpl, undefined, createDesktopVersionProbe({ fetchImpl }));
   const publicApi = new CapyPublicClient(fetchImpl);
   const store = new FileSecretStore();
   const runtime = new HeadlessDeviceRuntime({ app, store, clock, logger });

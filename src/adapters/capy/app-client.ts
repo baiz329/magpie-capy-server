@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 
 import type { ClerkSession } from "../../domain/account.ts";
@@ -14,8 +15,9 @@ import type {
   JamEvent,
   Organization,
 } from "../../ports/capy-app.ts";
-import { requestJson } from "../platform/http.ts";
+import { MAX_429_RETRIES, requestJson, type Retry429Options } from "../platform/http.ts";
 import { ClerkClient } from "./clerk-client.ts";
+import { createDesktopVersionProbe, desktopUserAgent, type DesktopVersionProbe } from "./client-version.ts";
 import { CAPY_APP, clientHeaders } from "./endpoints.ts";
 
 function deviceOs(): string {
@@ -31,10 +33,13 @@ function deviceArch(): string {
 export class CapyAppClient implements CapyAppPort {
   private readonly fetchImpl: typeof fetch;
   private readonly clerk: ClerkClient;
+  private readonly versionProbe: DesktopVersionProbe;
 
-  constructor(fetchImpl: typeof fetch = fetch, clerk = new ClerkClient(fetchImpl)) {
+  constructor(fetchImpl: typeof fetch = fetch, clerk = new ClerkClient(fetchImpl), versionProbe?: DesktopVersionProbe) {
     this.fetchImpl = fetchImpl;
     this.clerk = clerk;
+    // 不传则用同一 fetch 建一个默认探测器（缓存 24h，失败回退 0.9.2）。
+    this.versionProbe = versionProbe ?? createDesktopVersionProbe({ fetchImpl });
   }
 
   async sessionJwt(clerk: ClerkSession, signal?: AbortSignal): Promise<string> {
@@ -224,26 +229,42 @@ export class CapyAppClient implements CapyAppPort {
     input: CreateJamInput,
     signal?: AbortSignal,
   ): Promise<JamCreated> {
+    // 真实桌面端建对话请求的线上格式（2026-11-21 抓包，
+    // spec/capture/desktop-create-jam-2026-11-21.json；app.har entry 0）。
+    // 16 个字段按线上顺序发送，无值字段显式为 null（不省略）。
+    // clientKey 是独立 UUID（与 ULID 的 requestId 不同）；requestId 保持 ULID。
+    // 入参的 clientKey 不直接上网：调用方目前传的是 requestId 的复用值，
+    // 与真实客户端不符，这里按真实协议每次生成一个新 UUID。
+    // （后续应用层改用 ids.uuid() 生成 clientKey 后，这里可改回直接用入参。）
     const body = await this.json(jwt, `/orgs/${encodeURIComponent(orgId)}/jams`, {
       method: "POST",
       body: JSON.stringify({
         jamId: input.jamId,
         requestId: input.requestId,
-        clientKey: input.clientKey,
+        title: null,
         message: input.message,
         model: {
           modelId: input.modelId,
-          ...(input.reasoningMode ? { reasoningMode: input.reasoningMode } : {}),
+          reasoningMode: input.reasoningMode ?? null,
+          modes: null,
         },
+        mentions: null,
+        files: input.files && input.files.length > 0 ? input.files : null,
+        clientKey: randomUUID(),
+        machineSize: null,
         device: {
           deviceId: input.deviceId,
           workspace: { kind: "worktree" },
         },
-        ...(input.files && input.files.length > 0 ? { files: input.files } : {}),
-        ...(input.promptVariant ? { promptVariant: input.promptVariant } : {}),
+        branches: null,
+        environmentVariables: null,
+        slackChannelId: null,
+        promptVariant: input.promptVariant ?? null,
+        personal: null,
+        memberIds: null,
       }),
       ...(signal ? { signal } : {}),
-    }, input.ads ? { "x-capy-client-features": "message-edit,visual,ads-models" } : {});
+    }, input.ads ? { "x-capy-client-features": "message-edit,visual,ads-models" } : {}, { maxRetries: MAX_429_RETRIES });
     const record = body as Record<string, unknown>;
     const id = String(record.id ?? "").trim();
     if (!id) throw new CapyError("upstream_error", "Capy 创建线程没有返回 id");
@@ -271,7 +292,7 @@ export class CapyAppClient implements CapyAppPort {
     const body = await this.json(jwt, `/orgs/${encodeURIComponent(orgId)}/jams/${encodeURIComponent(jamId)}`, {
       method: "GET",
       ...(signal ? { signal } : {}),
-    });
+    }, {}, { maxRetries: MAX_429_RETRIES });
     const record = body as Record<string, unknown>;
     return {
       id: String(record.id ?? jamId),
@@ -290,6 +311,8 @@ export class CapyAppClient implements CapyAppPort {
       jwt,
       `/orgs/${encodeURIComponent(orgId)}/jams/${encodeURIComponent(jamId)}/events?limit=50`,
       { method: "GET", ...(signal ? { signal } : {}) },
+      {},
+      { maxRetries: MAX_429_RETRIES },
     );
     const record = body as { items?: unknown };
     const items = Array.isArray(record.items) ? record.items : [];
@@ -320,7 +343,7 @@ export class CapyAppClient implements CapyAppPort {
       method: "POST",
       body: "{}",
       ...(signal ? { signal } : {}),
-    });
+    }, {}, { maxRetries: MAX_429_RETRIES });
   }
 
   private async json(
@@ -328,15 +351,22 @@ export class CapyAppClient implements CapyAppPort {
     route: string,
     init: RequestInit & { signal?: AbortSignal },
     extraHeaders: Record<string, string> = {},
+    // 只对幂等操作传：429 有界重试（最多 2 次，尊重 Retry-After）。
+    // mintApiKey / startDeviceCode / approveDeviceCode 不传（每次调用都
+    // 产生新资源，重试会遗留孤儿 key/设备码）。
+    retry?: Retry429Options,
   ): Promise<unknown> {
+    // 每次请求前取一次当前桌面版本（命中缓存时立即返回，不产生请求）。
+    const version = await this.versionProbe.currentVersion();
     const { response, body, text } = await requestJson(
       this.fetchImpl,
       `${CAPY_APP}${route}`,
       {
         ...init,
-        headers: clientHeaders(jwt, "", extraHeaders),
+        headers: clientHeaders(jwt, "", extraHeaders, desktopUserAgent(version)),
       },
       30_000,
+      retry,
     );
     if (!response.ok) throw mapUpstream(response.status, body, text.slice(0, 300));
     return body;

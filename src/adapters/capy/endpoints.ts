@@ -4,15 +4,33 @@ export const CAPY_APP = "https://api.capy.ai/app";
 export const CAPY_PUBLIC = "https://api.capy.ai/api/v1";
 export const DEVICE_TUNNEL = "wss://device-tunnel-production.cloud.capy.ai/tunnel";
 export const CONTRACT_VERSION = 2;
+/** 桌面端 App API 的 Origin：Electron 自定义协议，不是 https://capy.ai。 */
+export const CAPY_APP_ORIGIN = "capy://app";
 
-function appHeaders(jwt: string, extra: Record<string, string> = {}): Record<string, string> {
+import { desktopSecChUa, desktopUserAgent, FALLBACK_DESKTOP_VERSION } from "./client-version.ts";
+
+/**
+ * App API 请求头：与真实桌面端一致（2026-11-21 抓包，
+ * spec/capture/desktop-create-jam-2026-11-21.json）。
+ * 桌面端不发 referer；origin 是 capy://app；sec-fetch-site 是 cross-site。
+ * 有意不发的：accept-encoding（fetch 运行时自动协商/解压）、
+ * b3/traceparent（桌面端观测 SDK 的逐请求追踪 id，不是固定值）。
+ */
+function appHeaders(jwt: string, extra: Record<string, string> = {}, userAgent: string = desktopUserAgent(FALLBACK_DESKTOP_VERSION)): Record<string, string> {
   return {
     authorization: `Bearer ${jwt}`,
-    origin: CAPY_ORIGIN,
-    referer: `${CAPY_ORIGIN}/`,
-    accept: "application/json",
+    accept: "*/*",
+    "accept-language": "en-US",
     "content-type": "application/json",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Capy/0.9.2 Chrome/140.0.0.0 Electron/45.2.3 Safari/537.36",
+    origin: CAPY_APP_ORIGIN,
+    priority: "u=1, i",
+    "sec-ch-ua": desktopSecChUa(),
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"Windows\"",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "cross-site",
+    "user-agent": userAgent,
     "x-capy-client-surface": "desktop",
     "x-capy-client-features": "message-edit,visual",
     "x-capy-client-timezone": timezone(),
@@ -20,11 +38,11 @@ function appHeaders(jwt: string, extra: Record<string, string> = {}): Record<str
   };
 }
 
-export function clientHeaders(jwt: string, clientId: string, extra: Record<string, string> = {}): Record<string, string> {
+export function clientHeaders(jwt: string, clientId: string, extra: Record<string, string> = {}, userAgent: string = desktopUserAgent(FALLBACK_DESKTOP_VERSION)): Record<string, string> {
   return appHeaders(jwt, {
     ...(clientId ? { "x-capy-client-id": clientId } : {}),
     ...extra,
-  });
+  }, userAgent);
 }
 
 export function publicHeaders(apiKey: string, extra: Record<string, string> = {}): Record<string, string> {

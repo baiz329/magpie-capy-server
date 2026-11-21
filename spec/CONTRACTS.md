@@ -108,11 +108,20 @@ POST /app/orgs/{orgId}/jams
 {
   "jamId": "jam_<ULID>",
   "requestId": "<ULID>",
-  "clientKey": "<ULID>",
+  "title": null,
   "message": "…",
-  "model": { "modelId": "particle/particle-1", "reasoningMode": "low" },
+  "model": { "modelId": "particle/particle-1", "reasoningMode": "low", "modes": null },
+  "mentions": null,
+  "files": null,
+  "clientKey": "<UUID>",
+  "machineSize": null,
   "device": { "deviceId": "device_…", "workspace": { "kind": "worktree" } },
-  "promptVariant": "minimal"    // 可选；403 时降级
+  "branches": null,
+  "environmentVariables": null,
+  "slackChannelId": null,
+  "promptVariant": "minimal",   // 无值时显式 null；403 时降级
+  "personal": null,
+  "memberIds": null
 }
 → {
   "id": "jam_…",
@@ -126,6 +135,9 @@ POST /app/orgs/{orgId}/jams
 规则：
 
 - `jamId` / `requestId` 必须是真 ULID（26 位 Crockford base32）。
+- `clientKey` 是独立 UUID（不是 requestId 的复用值）。
+- 16 个字段按上面顺序发送；无值字段显式为 null，不省略
+  （真实桌面端抓包，2026-11-21，见 `spec/capture/desktop-create-jam-2026-11-21.json`）。
 - projectless 线程必须带 `device`；否则 400。
 - `primaryMachine.kind` 必须是 `device`，不能是 `cloud`。
 

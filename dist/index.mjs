@@ -635,6 +635,7 @@ var STATIC_CATALOG = [
 ];
 
 // src/adapters/capy/app-client.ts
+import { randomUUID } from "crypto";
 import os from "os";
 
 // src/domain/errors.ts
@@ -748,7 +749,65 @@ function openAiErrorType(status) {
 }
 
 // src/adapters/platform/http.ts
-async function requestJson(fetchImpl, url, init = {}, timeoutMs = 30000) {
+var MAX_429_RETRIES = 2;
+var MAX_RETRY_AFTER_MS = 30000;
+function parseRetryAfterMs(value, nowMs = Date.now()) {
+  if (value === null)
+    return null;
+  const trimmed = value.trim();
+  if (!trimmed)
+    return null;
+  if (/^\d+$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    if (!Number.isFinite(seconds))
+      return null;
+    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+  }
+  if (!/^[A-Za-z]{3},\s\d{1,2}\s[A-Za-z]{3}\s\d{4}\s\d{2}:\d{2}:\d{2}\sGMT$/.test(trimmed))
+    return null;
+  const dateMs = Date.parse(trimmed);
+  if (Number.isNaN(dateMs))
+    return null;
+  return Math.max(0, Math.min(dateMs - nowMs, MAX_RETRY_AFTER_MS));
+}
+function retryDelayMs(headers, attempt, nowMs = Date.now()) {
+  const after = parseRetryAfterMs(headers.get("retry-after"), nowMs);
+  if (after !== null)
+    return after;
+  return Math.min(1000 * Math.max(1, attempt), MAX_RETRY_AFTER_MS);
+}
+async function defaultSleep(ms, signal) {
+  if (ms <= 0)
+    return;
+  if (signal?.aborted)
+    throw new DOMException("Aborted", "AbortError");
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+async function fetchWith429Retry(fetchImpl, url, init, options = {}) {
+  const maxRetries = options.maxRetries ?? MAX_429_RETRIES;
+  const sleep = options.sleep ?? defaultSleep;
+  let attempt = 0;
+  for (;; ) {
+    const response = await fetchImpl(url, init);
+    if (response.status !== 429 || attempt >= maxRetries)
+      return response;
+    const delay = retryDelayMs(response.headers, attempt + 1);
+    attempt += 1;
+    await response.body?.cancel().catch(() => {});
+    await sleep(delay, init.signal ?? undefined);
+  }
+}
+async function requestJson(fetchImpl, url, init = {}, timeoutMs = 30000, retry) {
   const controller = new AbortController;
   const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
   const signal = init.signal;
@@ -762,7 +821,7 @@ async function requestJson(fetchImpl, url, init = {}, timeoutMs = 30000) {
   try {
     let response;
     try {
-      response = await fetchImpl(url, { ...init, signal: controller.signal });
+      response = retry ? await fetchWith429Retry(fetchImpl, url, { ...init, signal: controller.signal }, retry) : await fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
       if (controller.signal.aborted && !signal?.aborted) {
         throw new CapyError("upstream_timeout", "\u8FDE\u63A5 Capy \u8D85\u65F6\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC/\u4EE3\u7406\u540E\u91CD\u8BD5", { cause: error });
@@ -785,6 +844,78 @@ async function requestJson(fetchImpl, url, init = {}, timeoutMs = 30000) {
   }
 }
 
+// src/adapters/capy/client-version.ts
+var CAPY_DOWNLOAD_URL = "https://capy.ai/download";
+var FALLBACK_DESKTOP_VERSION = "0.9.2";
+var DESKTOP_CHROME_VERSION = "156.0.8078.80";
+var DESKTOP_ELECTRON_VERSION = "45.2.3";
+var DEFAULT_VERSION_TTL_MS = 24 * 60 * 60 * 1000;
+var DEFAULT_VERSION_TIMEOUT_MS = 5000;
+var VERSION_RE = /Version\s+(\d+\.\d+\.\d+)/;
+function parseDesktopVersion(html) {
+  const match = VERSION_RE.exec(html);
+  const version = match?.[1];
+  return version ? version : null;
+}
+function desktopUserAgent(version) {
+  return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Capy/${version} Chrome/${DESKTOP_CHROME_VERSION} Electron/${DESKTOP_ELECTRON_VERSION} Safari/537.36`;
+}
+function desktopSecChUa() {
+  const major = DESKTOP_CHROME_VERSION.split(".")[0] ?? "";
+  return `"Not:A-Brand";v="8", "Chromium";v="${major}"`;
+}
+function createDesktopVersionProbe(options = {}) {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const downloadUrl = options.downloadUrl ?? CAPY_DOWNLOAD_URL;
+  const ttlMs = options.ttlMs ?? DEFAULT_VERSION_TTL_MS;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_VERSION_TIMEOUT_MS;
+  const now = options.now ?? Date.now;
+  let cached = null;
+  let inFlight = null;
+  async function probe() {
+    const controller = new AbortController;
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        controller.abort();
+        reject(new DOMException("Timed out", "TimeoutError"));
+      }, Math.max(1, timeoutMs));
+    });
+    try {
+      const response = await Promise.race([
+        fetchImpl(downloadUrl, { signal: controller.signal }),
+        timeout
+      ]);
+      if (!response.ok)
+        return cached?.version ?? FALLBACK_DESKTOP_VERSION;
+      const html = await response.text();
+      const version = parseDesktopVersion(html);
+      if (!version)
+        return cached?.version ?? FALLBACK_DESKTOP_VERSION;
+      cached = { version, atMs: now() };
+      return version;
+    } catch {
+      return cached?.version ?? FALLBACK_DESKTOP_VERSION;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+  return {
+    async currentVersion() {
+      if (cached && now() - cached.atMs < ttlMs)
+        return cached.version;
+      if (inFlight)
+        return inFlight;
+      inFlight = probe();
+      try {
+        return await inFlight;
+      } finally {
+        inFlight = null;
+      }
+    }
+  };
+}
+
 // src/adapters/capy/endpoints.ts
 var CAPY_ORIGIN = "https://capy.ai";
 var CAPY_FAPI = "https://clerk.capy.ai";
@@ -792,25 +923,33 @@ var CAPY_APP = "https://api.capy.ai/app";
 var CAPY_PUBLIC = "https://api.capy.ai/api/v1";
 var DEVICE_TUNNEL = "wss://device-tunnel-production.cloud.capy.ai/tunnel";
 var CONTRACT_VERSION = 2;
-function appHeaders(jwt, extra = {}) {
+var CAPY_APP_ORIGIN = "capy://app";
+function appHeaders(jwt, extra = {}, userAgent = desktopUserAgent(FALLBACK_DESKTOP_VERSION)) {
   return {
     authorization: `Bearer ${jwt}`,
-    origin: CAPY_ORIGIN,
-    referer: `${CAPY_ORIGIN}/`,
-    accept: "application/json",
+    accept: "*/*",
+    "accept-language": "en-US",
     "content-type": "application/json",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Capy/0.9.2 Chrome/140.0.0.0 Electron/45.2.3 Safari/537.36",
+    origin: CAPY_APP_ORIGIN,
+    priority: "u=1, i",
+    "sec-ch-ua": desktopSecChUa(),
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "cross-site",
+    "user-agent": userAgent,
     "x-capy-client-surface": "desktop",
     "x-capy-client-features": "message-edit,visual",
     "x-capy-client-timezone": timezone(),
     ...extra
   };
 }
-function clientHeaders(jwt, clientId, extra = {}) {
+function clientHeaders(jwt, clientId, extra = {}, userAgent = desktopUserAgent(FALLBACK_DESKTOP_VERSION)) {
   return appHeaders(jwt, {
     ...clientId ? { "x-capy-client-id": clientId } : {},
     ...extra
-  });
+  }, userAgent);
 }
 function publicHeaders(apiKey, extra = {}) {
   return { authorization: `Bearer ${apiKey}`, accept: "application/json", ...extra };
@@ -887,9 +1026,11 @@ function deviceArch() {
 class CapyAppClient {
   fetchImpl;
   clerk;
-  constructor(fetchImpl = fetch, clerk = new ClerkClient(fetchImpl)) {
+  versionProbe;
+  constructor(fetchImpl = fetch, clerk = new ClerkClient(fetchImpl), versionProbe) {
     this.fetchImpl = fetchImpl;
     this.clerk = clerk;
+    this.versionProbe = versionProbe ?? createDesktopVersionProbe({ fetchImpl });
   }
   async sessionJwt(clerk, signal) {
     return this.clerk.sessionJwt(clerk, signal);
@@ -1032,21 +1173,30 @@ class CapyAppClient {
       body: JSON.stringify({
         jamId: input.jamId,
         requestId: input.requestId,
-        clientKey: input.clientKey,
+        title: null,
         message: input.message,
         model: {
           modelId: input.modelId,
-          ...input.reasoningMode ? { reasoningMode: input.reasoningMode } : {}
+          reasoningMode: input.reasoningMode ?? null,
+          modes: null
         },
+        mentions: null,
+        files: input.files && input.files.length > 0 ? input.files : null,
+        clientKey: randomUUID(),
+        machineSize: null,
         device: {
           deviceId: input.deviceId,
           workspace: { kind: "worktree" }
         },
-        ...input.files && input.files.length > 0 ? { files: input.files } : {},
-        ...input.promptVariant ? { promptVariant: input.promptVariant } : {}
+        branches: null,
+        environmentVariables: null,
+        slackChannelId: null,
+        promptVariant: input.promptVariant ?? null,
+        personal: null,
+        memberIds: null
       }),
       ...signal ? { signal } : {}
-    }, input.ads ? { "x-capy-client-features": "message-edit,visual,ads-models" } : {});
+    }, input.ads ? { "x-capy-client-features": "message-edit,visual,ads-models" } : {}, { maxRetries: MAX_429_RETRIES });
     const record = body;
     const id = String(record.id ?? "").trim();
     if (!id)
@@ -1067,7 +1217,7 @@ class CapyAppClient {
     const body = await this.json(jwt, `/orgs/${encodeURIComponent(orgId)}/jams/${encodeURIComponent(jamId)}`, {
       method: "GET",
       ...signal ? { signal } : {}
-    });
+    }, {}, { maxRetries: MAX_429_RETRIES });
     const record = body;
     return {
       id: String(record.id ?? jamId),
@@ -1076,7 +1226,7 @@ class CapyAppClient {
     };
   }
   async getJamEvents(jwt, orgId, jamId, signal) {
-    const body = await this.json(jwt, `/orgs/${encodeURIComponent(orgId)}/jams/${encodeURIComponent(jamId)}/events?limit=50`, { method: "GET", ...signal ? { signal } : {} });
+    const body = await this.json(jwt, `/orgs/${encodeURIComponent(orgId)}/jams/${encodeURIComponent(jamId)}/events?limit=50`, { method: "GET", ...signal ? { signal } : {} }, {}, { maxRetries: MAX_429_RETRIES });
     const record = body;
     const items = Array.isArray(record.items) ? record.items : [];
     return items.flatMap((item) => {
@@ -1105,13 +1255,14 @@ class CapyAppClient {
       method: "POST",
       body: "{}",
       ...signal ? { signal } : {}
-    });
+    }, {}, { maxRetries: MAX_429_RETRIES });
   }
-  async json(jwt, route, init, extraHeaders = {}) {
+  async json(jwt, route, init, extraHeaders = {}, retry) {
+    const version = await this.versionProbe.currentVersion();
     const { response, body, text } = await requestJson(this.fetchImpl, `${CAPY_APP}${route}`, {
       ...init,
-      headers: clientHeaders(jwt, "", extraHeaders)
-    }, 30000);
+      headers: clientHeaders(jwt, "", extraHeaders, desktopUserAgent(version))
+    }, 30000, retry);
     if (!response.ok)
       throw mapUpstream(response.status, body, text.slice(0, 300));
     return body;
@@ -2674,14 +2825,14 @@ class CapyPublicClient {
     const url = `${CAPY_PUBLIC}/threads/${encodeURIComponent(threadId)}/stream?until=run`;
     let response;
     try {
-      response = await this.fetchImpl(url, {
+      response = await fetchWith429Retry(this.fetchImpl, url, {
         method: "GET",
         headers: {
           ...publicHeaders(apiKey),
           accept: "text/event-stream"
         },
         ...signal ? { signal } : {}
-      });
+      }, { maxRetries: MAX_429_RETRIES });
     } catch (error) {
       if (signal?.aborted)
         throw error;
@@ -3109,7 +3260,7 @@ function messageText(message) {
 }
 
 // src/adapters/platform/ulid.ts
-import { randomBytes, randomUUID } from "crypto";
+import { randomBytes, randomUUID as randomUUID2 } from "crypto";
 var ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 function ulid(now = Date.now(), random = randomBytes(10)) {
   let time = Math.max(0, Number(now) || 0);
@@ -3134,7 +3285,7 @@ class SystemIds {
     return ulid(now);
   }
   uuid() {
-    return randomUUID();
+    return randomUUID2();
   }
 }
 
@@ -4575,7 +4726,7 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
     logger.event("proxy_enabled", { proxy: host });
   }
   const cache = new MemoryCache(() => clock.now());
-  const app = new CapyAppClient(fetchImpl);
+  const app = new CapyAppClient(fetchImpl, undefined, createDesktopVersionProbe({ fetchImpl }));
   const publicApi = new CapyPublicClient(fetchImpl);
   const store = new FileSecretStore;
   const runtime = new HeadlessDeviceRuntime({ app, store, clock, logger });

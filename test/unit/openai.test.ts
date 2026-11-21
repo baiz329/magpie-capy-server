@@ -200,6 +200,16 @@ test("encodeErrorResponse：401 带 sign-in header", async () => {
   expect(body.error.code).toBe("sign_in_required");
 });
 
+test("encodeErrorResponse：429 返回 429，不带 sign-in header（网关据此切下一个账号）", async () => {
+  const response = encodeErrorResponse(new CapyError("rate_limited", "Capy 限流"));
+  expect(response.status).toBe(429);
+  expect(response.headers.get("x-magpie-sign-in")).toBeNull();
+  const body = await response.json() as { error: { code: string; status: number; type: string } };
+  expect(body.error.code).toBe("rate_limited");
+  expect(body.error.status).toBe(429);
+  expect(body.error.type).toBe("rate_limit_error");
+});
+
 test("encodeCompletion：上报传入的估算用量；不传则为 0", async () => {
   const withUsage = await encodeCompletion("id1", "m", 1, "你好", { promptTokens: 10, completionTokens: 3 }).json() as {
     usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
