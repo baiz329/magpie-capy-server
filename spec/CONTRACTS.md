@@ -137,7 +137,7 @@ POST /app/orgs/{orgId}/jams
 - `jamId` / `requestId` 必须是真 ULID（26 位 Crockford base32）。
 - `clientKey` 是独立 UUID（不是 requestId 的复用值）。
 - 16 个字段按上面顺序发送；无值字段显式为 null，不省略
-  （真实桌面端抓包，2026-11-21，见 `spec/capture/desktop-create-jam-2026-11-21.json`）。
+  （真实桌面端抓包，2026-11-21，内部取证，未随仓库分发）。
 - projectless 线程必须带 `device`；否则 400。
 - `primaryMachine.kind` 必须是 `device`，不能是 `cloud`。
 
@@ -148,7 +148,7 @@ GET /app/orgs/{orgId}/jams/{jamId}
 POST /app/orgs/{orgId}/jams/{jamId}/interrupt
 ```
 
-`ask.kind`：`credits` → 402；`desktop` → 503；其他 → 409。
+`ask.kind`：`credits` → 402；`desktop` → 503；其他 → 502 `upstream_error`（v0.3 文档写 409，实现从未如此：未知 kind 一律进 `upstream_error`）。
 
 ### 3.7 模型目录与默认模型（公开 API）
 
@@ -266,22 +266,22 @@ Authorization: Bearer capyd_…
 }
 ```
 
-### 5.3 已实现 handler
+### 5.3 handler 状态
 
 | handler | params | result |
 |---|---|---|
 | `bash` | `{command, timeoutSeconds, ...}` | `{kind:"bash", stdout, stderr, exitCode, durationMs, timedOut, isError}` |
-| `bash_output` | `{operationId}` | `{kind:"not-running"}` |
+| `bash_output` | `{operationId}` | 未实现，返回 `MachineServer.Unavailable` |
 | `read` | `{path, offset?, limit?, maxChars?}` | `{kind:"read", content, offset, totalLines, isError:false}` |
 | `write` | `{path, content}` | `{kind:"write", path, bytes, isError:false}` |
 | `edit` | `{path, oldString, newString, replaceAll?}` | `{kind:"edit", path, replacements, isError:false}` |
 | `file_read` | `{path}` | `{kind:"read"|"missing", ...}` |
 | `file_write` | `{path, content, baseSha?}` | `{kind:"written"|"conflict", ...}` |
 | `worktree_ensure` | `{root, checkouts?, startFromOrigin?}` | `{root, created, checkouts: []}` |
-| `worktree_list` | `{roots?, activeRoots?, dirty?}` | `{kind:"worktree_list", entries: []}` |
-| `volume_landed` | `{mounts:[{mountPath,digest}]}` | `{kind:"volume_landed", mounts:[{mountPath,current:true}], landing:false, checkpoints:false, directories:[], unretained:[], handback:true}` |
-| `volume_probe` | `{mounts:[…]}` | `{mounts:[{mountPath,state:"current"}]}` |
-| `POST /v1/git/capture` | `{repos:[],baseRefs:["origin/HEAD"]}` | `{repos:[]}` |
+| `worktree_list` | `{roots?, activeRoots?, dirty?}` | `{kind:"worktree_list", entries: []}`（允许，固定 base 下，只列一级目录） |
+| `volume_landed` | `{mounts:[{mountPath,digest}]}` | 未实现，返回 `MachineServer.Unavailable` |
+| `volume_probe` | `{mounts:[…]}` | 未实现，返回 `MachineServer.Unavailable` |
+| `POST /v1/git/capture` | `{repos:[],baseRefs:["origin/HEAD"]}` | 占位，恒返回 `{repos:[]}` |
 | 浏览器/computer 等 | — | `{status:"failed", error:{code:"MachineServer.Unavailable", message:"…"}}` |
 
 ### 5.4 结果包装
@@ -325,7 +325,7 @@ Accept: text/event-stream
 - `transcript(source=assistant)` 是最终文本；用它校正。
 - `turn outcome=dropped` 丢弃 live 片段。
 - `error.code=region_unsupported` → 403。
-- `run end` / `done` 完成；无 delta 才允许轮询 fallback。
+- `run end` / `done` 完成；无 delta 才允许轮询 fallback（**未实现，v0.3.1 不做**：无 delta 时直接报错，不轮询）。
 
 ## 7. Files（附件）
 
@@ -350,7 +350,7 @@ Content-Length: 785
 
 限制（来自公开 OpenAPI `UploadFilesRequest`）：`sizeBytes` 取值 1–262,144,000
 （单文件 250 MB）；`files` 至少 1 个，**没有** API 级数量/总大小上限。
-本机/内网 URL 由插件做 SSRF 拒绝。
+本机/内网 URL 由插件做 SSRF 拒绝（用户提供的下载 URL）；预签名 PUT 目标是 Capy 签发的，豁免 DNS 解析判定（仍要求 https:443、0 跳、60s 超时）。
 
 ## 8. Usage
 
@@ -392,8 +392,11 @@ data: [DONE]
   "object": "chat.completion",
   "model": "…",
   "choices": [{ "index": 0, "message": { "role": "assistant", "content": "pong" }, "finish_reason": "stop" }],
-  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+  "usage": { "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15 }
 }
+```
+
+注：`usage` 是插件按启发式估算的值（CJK 约 1 token/字，其余约 1 token/4 字符），不是上游返回的精确计数，不可计费。
 ```
 
 ### 9.2 `/models`
@@ -418,7 +421,7 @@ data: [DONE]
 | 402 / `capy/PaidFeatureUnavailable` | 402 `insufficient_quota` |
 | 403 / `region_unsupported` | 403 `region_unsupported` |
 | 403 / `capy/Forbidden` | 403 `upstream_error` |
-| 429 / `capy/RateLimited` | 429 `rate_limited` + `retry-after` |
+| 429 / `capy/RateLimited` | 429 `rate_limited` + `retry-after`（仅上游给过 `Retry-After` 时才带） |
 | 5xx / 网络 | 503 `upstream_unavailable` |
 | 超时 | 504 `upstream_timeout` |
 | 设备配对失败 | 403 `device_pair_failed` |

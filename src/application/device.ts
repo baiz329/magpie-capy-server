@@ -28,6 +28,11 @@ export class DeviceUseCase {
     }
   }
 
+  /** 只读快照：不配对、不建连、不发网络请求。 */
+  peek(session: AccountSession): DeviceInfo {
+    return this.runtime.peek(session);
+  }
+
   close(): void {
     this.inflight.clear();
     this.runtime.close();

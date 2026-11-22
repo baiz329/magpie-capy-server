@@ -3,8 +3,13 @@ import type { RawModel } from "../../domain/model.ts";
 /**
  * Capy 公共 /api/v1/models 的静态快照（clean-room）。
  * 生成时间：2026-11-20；条目：62。
+ * 注意：静态清单会过期（P3-13）——线上目录以运行时 /models 为准，
+ * 这里只作离线兜底；超过 30 天未刷新就应重新抓取。
  * 更新方式：scripts/refresh-catalog.ts（待实现）。
  */
+
+/** 静态快照生成日期（ISO）；供调用方判断清单是否过期。 */
+export const STATIC_CATALOG_GENERATED_AT = "2026-11-20";
 export const STATIC_CATALOG: readonly RawModel[] = [
   {
     "id": "anthropic/claude-fable-5",

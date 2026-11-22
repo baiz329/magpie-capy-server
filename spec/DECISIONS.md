@@ -9,8 +9,12 @@
 | [005](./adr/005-capability-registry.md) | 能力注册表 + 模型策略 + 可替换 ToolBridge | Accepted |
 | [006](./adr/006-no-database.md) | 不引入数据库/队列；DPAPI 极小状态 | Accepted |
 | [007](./adr/007-provider-id.md) | provider id = `capy` | Accepted |
-| [008](./adr/008-cookie-login.md) | 无头粘贴 Cookie 登录：`__client` + Cookie 中提取的 sessionId，复用统一换票链 | Accepted |
-| [009](./adr/009-two-box-cookie-login.md) | 两框粘贴 Cookie 登录（prompts + auto）+ 非流式用量估算上报；README v0.2 修正与风险/限制说明 | Accepted |
+| [008](./adr/008-cookie-login.md) | 无头粘贴 Cookie 登录：`__client` + Cookie 中提取的 sessionId，复用统一换票链 | Superseded by ADR-009 |
+| [009](./adr/009-two-box-cookie-login.md) | 两框粘贴 Cookie 登录（prompts + auto）+ 非流式用量估算上报；README v0.2 修正与风险/限制说明 | Accepted（用量上报部分 Superseded，见下） |
+| [010](./adr/010-gateway-owns-failover.md) | 网关拥有 failover：插件把 429/401 原样透传，401 → sign_in_required | Accepted |
+| [011](./adr/011-create-jam-desktop-alignment.md) | createJam 16 字段与桌面端逐字对齐 | Accepted |
+| [012](./adr/012-machine-capability-and-path-confinement.md) | machine 能力分级（off/files/full，默认 files）+ 路径隔离 confine | Accepted |
+| [013](./adr/013-v031-security-and-correctness-fixes.md) | v0.3.1 安全与正确性修复（八位专家审计核实后） | Accepted |
 
 ## 用量上报：网关只认流里的 usage chunk（2026-11-20）
 

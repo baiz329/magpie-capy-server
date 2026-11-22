@@ -1,5 +1,7 @@
 import { execFileSync } from "node:child_process";
 
+import { CapyError } from "../../domain/errors.ts";
+
 const REG_PATH = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 const PROXY_KEYS = [
   "MAGPIE_CAPY_PROXY",
@@ -55,6 +57,28 @@ function normalizeProxyUrl(raw: unknown): string {
   }
 }
 
+/**
+ * 只输出 `scheme://host:port`（H-02）：代理 URL 里可能带 `user:pass`，
+ * 原来整条 URL 被打进 warn 日志等于把代理凭据写进磁盘。
+ */
+export function describeProxy(raw: string): string {
+  const text = normalizeProxyUrl(raw);
+  if (!text) return "configured";
+  try {
+    const url = new URL(text);
+    const scheme = url.protocol.replace(/:$/u, "") || "http";
+    const port = url.port || (scheme === "https" ? "443" : "80");
+    return `${scheme}://${url.hostname}:${port}`;
+  } catch {
+    return "configured";
+  }
+}
+
+/** 默认 fail-closed：只有显式 `MAGPIE_CAPY_PROXY_FALLBACK=direct` 才允许直连兜底。 */
+function allowDirectFallback(): boolean {
+  return String(process.env.MAGPIE_CAPY_PROXY_FALLBACK ?? "").trim().toLowerCase() === "direct";
+}
+
 function systemProxy(): string {
   if (process.platform !== "win32") return "";
   if (Date.now() - cachedSystemProxy.at < SYSTEM_PROXY_TTL_MS) return cachedSystemProxy.value;
@@ -84,8 +108,15 @@ export function resolveProxyUrl(options: {
   readonly env?: Record<string, string | undefined>;
 } = {}): string {
   if (options.proxy === false) return "";
-  if (typeof options.proxy === "string" && options.proxy.trim()) return normalizeProxyUrl(options.proxy);
+  if (typeof options.proxy === "string") {
+    const explicit = options.proxy.trim().toLowerCase();
+    if (explicit === "off" || explicit === "false" || explicit === "none") return "";
+    if (explicit) return normalizeProxyUrl(options.proxy);
+  }
   const env = options.env ?? process.env;
+  // MAGPIE_CAPY_PROXY=off 是显式禁用：不再继续读 HTTPS_PROXY（H-03）。
+  const envOff = String(env.MAGPIE_CAPY_PROXY ?? "").trim().toLowerCase();
+  if (envOff === "off" || envOff === "false" || envOff === "none") return "";
   for (const key of PROXY_KEYS) {
     const value = normalizeProxyUrl(env[key]);
     if (value) return value;
@@ -99,8 +130,14 @@ function proxyConnectionError(error: unknown): boolean {
 }
 
 /**
- * Bun 用 fetch 的 proxy 选项；Node 有 undici 就 timeout ProxyAgent；
- * 代理连接失败时直连一次，其它错误照常抛。
+ * Bun 用 fetch 的 proxy 选项；Node 有 undici 就挂 ProxyAgent。
+ *
+ * 代理连不上时**默认失败**（fail-closed，H-03）：静默直连会让"必须走代理"的网络
+ * 悄悄绕过代理，既不可预期也可能违反合规。需要兜底时显式设
+ * `MAGPIE_CAPY_PROXY_FALLBACK=direct`。
+ *
+ * 另外：Bun 分支不再退到全局 `fetch`（H-03：那会绕过注入的 baseFetch，
+ * 生产里等于绕过重试/超时/测试替身）。
  */
 export function createProxyFetch(
   baseFetch: typeof fetch,
@@ -109,6 +146,7 @@ export function createProxyFetch(
 ): typeof fetch {
   const url = normalizeProxyUrl(proxyUrl);
   if (!url) return baseFetch;
+  const label = describeProxy(url);
 
   let warned = false;
   let undiciAgent: unknown = null;
@@ -131,24 +169,19 @@ export function createProxyFetch(
       return baseFetch(input, init);
     }
 
+    const directInstead = (reason: string, error: unknown): Promise<Response> => {
+      if (!allowDirectFallback()) throw error;
+      warn(`${reason}，按 MAGPIE_CAPY_PROXY_FALLBACK=direct 本次直连`);
+      return baseFetch(input, init);
+    };
+
     if (typeof Bun !== "undefined") {
       const withProxy = { ...init, proxy: url } as RequestInit & { proxy: string };
       try {
         return await baseFetch(input, withProxy);
       } catch (error) {
-        if (proxyConnectionError(error)) {
-          warn(`代理 ${url} 连接失败，本次直连`);
-          return baseFetch(input, init);
-        }
-        try {
-          return await fetch(input, withProxy);
-        } catch (inner) {
-          if (proxyConnectionError(inner)) {
-            warn(`代理 ${url} 连接失败，本次直连`);
-            return baseFetch(input, init);
-          }
-          throw error;
-        }
+        if (proxyConnectionError(error)) return directInstead(`代理 ${label} 连接失败`, error);
+        throw error;
       }
     }
 
@@ -166,19 +199,20 @@ export function createProxyFetch(
       const withDispatcher = { ...init, dispatcher: undiciAgent } as RequestInit & { dispatcher: unknown };
       try {
         return await baseFetch(input, withDispatcher);
-      } catch {
-        try {
-          return await baseFetch(input, { ...init, proxy: url } as RequestInit & { proxy: string });
-        } catch {
-          // fall through to direct
-        }
+      } catch (error) {
+        if (proxyConnectionError(error)) return directInstead(`代理 ${label} 连接失败`, error);
+        throw error;
       }
     }
 
     warn(
-      `检测到代理 ${url}，但当前 Node 运行时不支持 fetch 代理（未安装 undici）。`
+      `检测到代理 ${label}，但当前 Node 运行时不支持 fetch 代理（未安装 undici）。`
       + "请改用 magpie 自带 Bun 运行时，或设置 NODE_OPTIONS=--use-env-proxy 后重启。",
     );
-    return baseFetch(input, init);
+    if (allowDirectFallback()) return baseFetch(input, init);
+    throw new CapyError(
+      "upstream_unavailable",
+      `当前运行时不支持 fetch 代理（${label}）：请安装 undici，或设置 MAGPIE_CAPY_PROXY_FALLBACK=direct 允许直连兜底`,
+    );
   } as typeof fetch;
 }

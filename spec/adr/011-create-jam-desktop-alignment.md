@@ -13,14 +13,13 @@ UA 里 Chrome 段写死 `140.0.0.0`。第 4 项改进的目标是把它与真实
 发出的请求对齐，缩小指纹面。
 
 核实方法：Lin 2026-11-21 在 Capy 桌面版（Electron）里用 DevTools 抓到的
-真实建对话请求（HAR：`~/workspace/user/files/app.har` entry 0；已脱敏副本：
-`spec/capture/desktop-create-jam-2026-11-21.json`）。对照时以原始 HAR 的
+真实建对话请求（内部取证，未随仓库分发）。对照时以原始抓包的
 `postData` 文本为准（字段顺序），不要以脱敏 JSON 文件的字母排序为准。
 同文件还附了一条网页端发消息请求，只作对照参考。
 
 ## 核实结论（桌面端，surface=desktop）
 
-- **请求体是固定 16 个字段，按线上顺序发送**（app.har entry 0 的 postData 原文）：
+- **请求体是固定 16 个字段，按线上顺序发送**（内部取证的 postData 原文）：
   `jamId`、`requestId`、`title`、`message`、`model`、`mentions`、`files`、
   `clientKey`、`machineSize`、`device`、`branches`、`environmentVariables`、
   `slackChannelId`、`promptVariant`、`personal`、`memberIds`。

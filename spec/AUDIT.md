@@ -56,7 +56,7 @@
 | `temperature:false` | `src/entry/plugin.ts` | Capy `ModelSelection` 没有 temperature，属于协议事实 |
 | 所有模型 `image/pdf/attachment=true` | `src/domain/model.ts` | Capy files 通道接受图片/PDF；模型是否“看懂”由模型决定；不是 `/models` 字段 |
 | `toolcall=true` | `src/domain/model.ts` | 不是原生 tools，是 `PromptToolBridge` 的提示词约定 |
-| 非流式 `usage` 全 0 | `src/protocol/openai.ts` | 占位；Capy 公共 SSE 不给 token 计数 |
+| 非流式 `usage` 为估算值 | `src/protocol/openai.ts` | 启发式估算（CJK 约 1 token/字，其余约 1 token/4 字符）；近似值，不可计费；Capy 公共 SSE 不给 token 计数 |
 | `PromptToolBridge` | `src/application/tools.ts` | 提示词桥；Capy agent 可能忽略并用自己的工具 |
 | `npm: "@ai-sdk/openai-compatible"` | `src/entry/plugin.ts` | 给 Magpie 的 SDK 提示；Capy 没有官方 SDK |
 | `searches: false` | `src/entry/plugin.ts` | 告诉 Magpie 没有搜索能力；不是 Capy 字段 |
@@ -170,7 +170,7 @@ entry 的 `_internal` / `DEFAULT_MODEL_ID` / `PUBLIC_API_BASE` 导出。
 | assistant 帧若以旧文本为前缀就视为增量，否则拼接 | `application/stream.ts` | 兼容两种 SSE 编码；不是协议保证 |
 | transcript 只在“旧文本是前缀”时补 delta | `application/stream.ts` | 无法流式撤回已发内容，只能校正最终文本 |
 | `ask.kind` 未知时映射 `upstream_error` | `application/chat.ts` | 只确认 credits/desktop 两类 |
-| 非流式 `usage` 全 0 | `protocol/openai.ts` | 占位；不是真实 token 计数 |
+| 非流式 `usage` 为估算值 | `protocol/openai.ts` | 启发式估算；不是真实 token 计数，不可计费 |
 | `variants` 每个 reasoningMode 映射到空对象 | `entry/plugin.ts` | Magpie 变体占位；没有真实参数 |
 | `parseChatRequest` 只接受 `type:"function"` 工具 | `protocol/openai.ts` | OpenAI 目前只有 function tools |
 | `PromptToolBridge` 用固定英文提示词 + JSON 契约 | `application/tools.ts` | 模型可能忽略；不是原生 tools |
@@ -187,7 +187,7 @@ entry 的 `_internal` / `DEFAULT_MODEL_ID` / `PUBLIC_API_BASE` 导出。
 | `EXTRA_FREE_MODELS` | App-only 模型 id/档位变化 | 来自 App 模型选择器；公共 `/models` 不返回 |
 | 模型能力 `image/pdf/tools` | 不是 `/models` 字段 | 目前是通道能力策略；如要精确，需要按模型实测能力表 |
 | `capy` provider id | 已切换 | ADR-007 |
-| 非流式 `usage` 全 0 | 不是真实用量 | 后续可从 `context-usage`/`usage` 补，或省略 usage |
+| 非流式 `usage` 为估算值 | 是估算值，不是真实用量 | 已用启发式估算上报；后续可从 `context-usage`/`usage` 补，或省略 usage |
 | `promptVariant:"minimal"` 403 降级 | 已实现：403 自动改 default 重试并记住 | Works |
 | 附件上传/SSRF | 已实现；文件缓存未做 | 限制按 250MB/文件；缓存可选 |
 | 工具调用 | 只支持“模型输出 JSON”桥，不是原生 tools | 保持明确边界；不要宣称原生 tools |

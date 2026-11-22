@@ -35,3 +35,26 @@ test("toOpenAiError：形状/状态/type", () => {
   const invalid = toOpenAiError(new CapyError("invalid_request", "bad"));
   expect(invalid.error.type).toBe("invalid_request_error");
 });
+
+test("mapUpstream：429 带 retryAfterMs 才进 CapyError（M-14 死代码消除）", () => {
+  const withAfter = mapUpstream(429, { _tag: "capy/RateLimited" }, "", 5000);
+  expect(withAfter.kind).toBe("rate_limited");
+  expect(withAfter.retryAfterMs).toBe(5000);
+  const without = mapUpstream(429, { _tag: "capy/RateLimited" });
+  expect(without.retryAfterMs).toBeUndefined();
+});
+
+test("mapUpstream：403 body 码 region_unsupported → region_unsupported（M-14）", () => {
+  const error = mapUpstream(403, { _tag: "capy/Forbidden", code: "region_unsupported", message: "only US" });
+  expect(error.kind).toBe("region_unsupported");
+  expect(error.status).toBe(403);
+  expect(mapUpstream(403, { _tag: "capy/Forbidden" }).kind).toBe("upstream_error");
+});
+
+test("retryAfterSeconds：429 的毫秒向上取整；无值/非 CapyError → null", async () => {
+  const { retryAfterSeconds } = await import("../../src/domain/errors.ts");
+  expect(retryAfterSeconds(new CapyError("rate_limited", "slow", { retryAfterMs: 2500 }))).toBe(3);
+  expect(retryAfterSeconds(new CapyError("rate_limited", "slow", { retryAfterMs: 0 }))).toBe(0);
+  expect(retryAfterSeconds(new CapyError("rate_limited", "slow"))).toBeNull();
+  expect(retryAfterSeconds(new Error("boom"))).toBeNull();
+});

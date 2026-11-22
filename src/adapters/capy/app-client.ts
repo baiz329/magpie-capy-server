@@ -18,7 +18,7 @@ import type {
 import { MAX_429_RETRIES, requestJson, type Retry429Options } from "../platform/http.ts";
 import { ClerkClient } from "./clerk-client.ts";
 import { createDesktopVersionProbe, desktopUserAgent, type DesktopVersionProbe } from "./client-version.ts";
-import { CAPY_APP, clientHeaders } from "./endpoints.ts";
+import { CAPY_APP, clientFeatures, clientHeaders } from "./endpoints.ts";
 
 function deviceOs(): string {
   if (process.platform === "win32") return "win32";
@@ -229,8 +229,7 @@ export class CapyAppClient implements CapyAppPort {
     input: CreateJamInput,
     signal?: AbortSignal,
   ): Promise<JamCreated> {
-    // 真实桌面端建对话请求的线上格式（2026-11-21 抓包，
-    // spec/capture/desktop-create-jam-2026-11-21.json；app.har entry 0）。
+    // 真实桌面端建对话请求的线上格式（2026-11-21 内部取证，未随仓库分发）。
     // 16 个字段按线上顺序发送，无值字段显式为 null（不省略）。
     // clientKey 是独立 UUID（与 ULID 的 requestId 不同）；requestId 保持 ULID。
     // 入参的 clientKey 不直接上网：调用方目前传的是 requestId 的复用值，
@@ -264,18 +263,23 @@ export class CapyAppClient implements CapyAppPort {
         memberIds: null,
       }),
       ...(signal ? { signal } : {}),
-    }, input.ads ? { "x-capy-client-features": "message-edit,visual,ads-models" } : {}, { maxRetries: MAX_429_RETRIES });
+    }, input.ads ? { "x-capy-client-features": clientFeatures(true) } : {}, { maxRetries: MAX_429_RETRIES });
     const record = body as Record<string, unknown>;
     const id = String(record.id ?? "").trim();
     if (!id) throw new CapyError("upstream_error", "Capy 创建线程没有返回 id");
+    // kind 非 "cloud" 不再默认 "device"：缺 primaryMachine 或 kind 未知时显式报错（M-16）。
     const machine = record.primaryMachine;
-    const kind = machine && typeof machine === "object" && !Array.isArray(machine)
-      ? String((machine as Record<string, unknown>).kind ?? "")
-      : "";
+    if (!machine || typeof machine !== "object" || Array.isArray(machine)) {
+      throw new CapyError("upstream_error", "Capy 创建线程没有返回 primaryMachine");
+    }
+    const kind = String((machine as Record<string, unknown>).kind ?? "");
+    if (kind !== "device" && kind !== "cloud") {
+      throw new CapyError("upstream_error", `Capy 创建线程返回了未知的 primaryMachine kind：${kind || "（空）"}`);
+    }
     return {
       id,
       primaryMachine: {
-        kind: kind === "cloud" ? "cloud" : "device",
+        kind,
         ...(machine && typeof machine === "object" && !Array.isArray(machine)
           && typeof (machine as Record<string, unknown>).name === "string"
           ? { name: String((machine as Record<string, unknown>).name) }

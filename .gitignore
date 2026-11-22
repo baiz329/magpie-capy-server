@@ -4,3 +4,15 @@ coverage/
 .env
 .env.*
 .DS_Store
+
+# Capy 设备 token 与取证文件：绝不能进仓库
+headless-*.json
+*.tmp
+*.har
+# Cookie 导出（Cookie-Editor 等）
+cookies.json
+cookies-*.json
+*-cookies.json
+cookie-editor*.json
+# 本地 STATE_DIR（若有人把它设在仓库内）
+magpie-capy/

@@ -69,10 +69,10 @@ test("buildPrompt：单条 user 原样；多轮/系统块", () => {
     { role: "user", content: "hi" },
     { role: "assistant", content: "hello" },
     { role: "user", content: "again" },
-  ]);
-  expect(multi).toContain("<system>\nbe terse\n</system>");
-  expect(multi).toContain("<conversation>");
-  expect(multi).toContain("<user>\nagain\n</user>");
+  ], { nonce: "test-nonce" });
+  expect(multi).toContain("<<<CAPY:test-nonce:SYSTEM>>>\nbe terse");
+  expect(multi).toContain("<<<CAPY:test-nonce:CONVERSATION>>>");
+  expect(multi).toContain("<<<CAPY:test-nonce:USER>>>\nagain");
   expect(multi).toContain("Reply to the last user message.");
 });
 
@@ -88,7 +88,7 @@ test("buildPrompt：超长多轮不丢任何消息", () => {
     role: "user" as const,
     content: `MSG_${i}_${"x".repeat(5000)}`,
   }));
-  const text = buildPrompt(messages);
+  const text = buildPrompt(messages, { nonce: "test-nonce" });
   expect(text.length).toBeGreaterThan(160_000);
   expect(text).toContain("MSG_0_");
   expect(text).toContain("MSG_39_");
@@ -101,7 +101,7 @@ test("buildPrompt：超长 system 原样保留，不被压缩", () => {
   const text = buildPrompt([
     { role: "system", content: system },
     { role: "user", content: question },
-  ]);
+  ], { nonce: "test-nonce" });
   expect(text.length).toBeGreaterThan(200_000);
   expect(text).toContain(system);
   expect(text).toContain(question);
@@ -219,4 +219,74 @@ test("encodeCompletion：上报传入的估算用量；不传则为 0", async ()
     usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
   };
   expect(withoutUsage.usage).toEqual({ prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+});
+
+test("encodeChatStream：上游生成器结束但无 done 事件 → error + [DONE]，不发假 stop（M-11）", async () => {
+  async function* events(): AsyncIterable<ChatEvent> {
+    yield { type: "delta", text: "po" };
+  }
+  const response = encodeChatStream(events(), { id: "chatcmpl-1", model: "m", created: 1 });
+  const text = await response.text();
+  expect(text).toContain("upstream_unavailable");
+  expect(text).not.toContain("\"finish_reason\":\"stop\"");
+  expect(text).toContain("data: [DONE]");
+});
+
+test("encodeChatStream：首个事件是 error 时不先发空 role chunk（H-10）", async () => {
+  async function* events(): AsyncIterable<ChatEvent> {
+    yield { type: "error", error: new CapyError("rate_limited", "Capy 限流") };
+  }
+  const response = encodeChatStream(events(), { id: "chatcmpl-1", model: "m", created: 1 });
+  const text = await response.text();
+  expect(text).not.toContain("\"role\":\"assistant\"");
+  expect(text).toContain("rate_limited");
+});
+
+test("encodeChatStream：取消时调 onCancel 并关闭上游迭代器（M-11）", async () => {
+  let upstreamClosed = false;
+  let cancelCalled = false;
+  async function* events(): AsyncIterable<ChatEvent> {
+    try {
+      yield { type: "delta", text: "po" };
+      for (;;) yield { type: "delta", text: "ng" };
+    } finally {
+      upstreamClosed = true;
+    }
+  }
+  const response = encodeChatStream(
+    events(),
+    { id: "chatcmpl-1", model: "m", created: 1 },
+    undefined,
+    () => { cancelCalled = true; },
+  );
+  const reader = response.body!.getReader();
+  const first = await reader.read();
+  expect(first.done).toBe(false);
+  await reader.cancel("client gone");
+  expect(cancelCalled).toBe(true);
+  expect(upstreamClosed).toBe(true);
+});
+
+test("encodeErrorResponse：429 有 retryAfterMs 才带 retry-after 头（H-10/M-14）", async () => {
+  const withAfter = encodeErrorResponse(
+    new CapyError("rate_limited", "Capy 限流", { retryAfterMs: 2500 }),
+  );
+  expect(withAfter.status).toBe(429);
+  expect(withAfter.headers.get("retry-after")).toBe("3");
+  const without = encodeErrorResponse(new CapyError("rate_limited", "Capy 限流"));
+  expect(without.headers.get("retry-after")).toBeNull();
+});
+
+test("parseChatRequest：stream 宽松转换 \"true\"/1/\"1\" 都认（P3-09）", () => {
+  const base = { model: "m", messages: [{ role: "user", content: "hi" }] };
+  expect(parseChatRequest({ ...base, stream: "true" }).stream).toBe(true);
+  expect(parseChatRequest({ ...base, stream: 1 }).stream).toBe(true);
+  expect(parseChatRequest({ ...base, stream: "1" }).stream).toBe(true);
+  expect(parseChatRequest({ ...base, stream: false }).stream).toBe(false);
+  expect(parseChatRequest({ ...base }).stream).toBe(false);
+});
+
+test("parseChatRequest：messages 超 200 条拒绝（P3-09）", () => {
+  const messages = Array.from({ length: 201 }, () => ({ role: "user", content: "hi" }));
+  expect(() => parseChatRequest({ model: "m", messages })).toThrow("200");
 });

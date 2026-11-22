@@ -8,6 +8,7 @@ import type {
   UploadedFile,
 } from "../../ports/capy-public.ts";
 import { decodeSseStream } from "../../protocol/sse.ts";
+import { createGuardedFetch, type GuardedLookup } from "../platform/guarded-fetch.ts";
 import { fetchWith429Retry, MAX_429_RETRIES, requestJson } from "../platform/http.ts";
 import { CAPY_PUBLIC, publicHeaders } from "./endpoints.ts";
 
@@ -52,11 +53,39 @@ function modelDefault(value: unknown): ModelDefaultInfo | undefined {
   };
 }
 
+export interface CapyPublicClientOptions {
+  /** SSE 连续无数据的空闲上限（毫秒）；超过即断开并报 upstream_timeout。 */
+  readonly sseIdleMs?: number;
+  /** 预签名 PUT 的 DNS 解析（测试注入；默认 node:dns）。 */
+  readonly presignLookup?: GuardedLookup;
+}
+
+/** SSE 空闲 deadline 默认值（M-10）：长推理也应有心跳/数据，2 分钟无数据即断开。 */
+export const DEFAULT_SSE_IDLE_MS = 120_000;
+
 export class CapyPublicClient implements CapyPublicPort {
   private readonly fetchImpl: typeof fetch;
+  /**
+   * 预签名 PUT 专用（H-01/M-12）：上游给的 target.url 由服务端签发，
+   * 不是用户可控输入，因此豁免 DNS 解析判定——代理环境会把域名解析到
+   * 198.18.169.x 这类禁段，不豁免会把附件上传整个堵死。
+   * 仍保留 https:443、0 跳重定向、60s 超时；字面量私网主机名照常拦。
+   * 用户提供的附件下载 URL 仍走完整 DNS 判定（见 entry 的 attachmentFetch）。
+   */
+  private readonly presignPut: typeof fetch;
+  private readonly sseIdleMs: number;
 
-  constructor(fetchImpl: typeof fetch = fetch) {
+  constructor(fetchImpl: typeof fetch = fetch, options: CapyPublicClientOptions = {}) {
     this.fetchImpl = fetchImpl;
+    this.presignPut = createGuardedFetch(fetchImpl, {
+      requireHttps: true,
+      allowPorts: [443],
+      maxRedirects: 0,
+      timeoutMs: 60_000,
+      skipDnsCheck: true,
+      ...(options.presignLookup ? { lookup: options.presignLookup } : {}),
+    });
+    this.sseIdleMs = Math.max(1, options.sseIdleMs ?? DEFAULT_SSE_IDLE_MS);
   }
 
   async listModels(apiKey: string, signal?: AbortSignal): Promise<{
@@ -108,12 +137,18 @@ export class CapyPublicClient implements CapyPublicPort {
     }
     if (!response.body) throw new CapyError("upstream_unavailable", "Capy 流没有响应体");
     const body = response.body;
+    const idleMs = this.sseIdleMs;
     async function* chunks(): AsyncIterable<Uint8Array> {
       const reader = body.getReader();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) return;
-        if (value) yield value;
+      try {
+        for (;;) {
+          // 每次 read 都受空闲 deadline 约束（M-10）：流挂住不再无限等。
+          const { done, value } = await readWithIdleDeadline(reader.read(), idleMs);
+          if (done) return;
+          if (value) yield value;
+        }
+      } finally {
+        await reader.cancel().catch(() => undefined);
       }
     }
     for await (const frame of decodeSseStream(chunks())) {
@@ -153,35 +188,55 @@ export class CapyPublicClient implements CapyPublicPort {
     if (!Array.isArray(targets) || targets.length !== files.length) {
       throw new CapyError("upstream_error", "Capy 没有返回足够的文件上传目标");
     }
-    const out: UploadedFile[] = [];
-    for (let i = 0; i < files.length; i += 1) {
-      const file = files[i];
+    // 先校验全部目标，再有界并发上传（P3-03：3 路，保序返回）。
+    const jobs = files.map((file, i) => {
       const target = targets[i] as { fileId?: unknown; url?: unknown } | undefined;
       if (!file || !target || typeof target.fileId !== "string" || typeof target.url !== "string") {
         throw new CapyError("upstream_error", "Capy 文件上传目标缺少 fileId/url");
       }
-      const put = await this.fetchImpl(target.url, {
-        method: "PUT",
-        headers: {
-          "content-type": file.mediaType,
-          "content-length": String(file.bytes.length),
-        },
-        body: file.bytes as unknown as BodyInit,
-        ...(signal ? { signal } : {}),
-      });
-      if (!put.ok) {
-        const detail = await put.text().catch(() => "");
-        throw new CapyError("upstream_error", `附件上传失败（HTTP ${put.status}）`, {
-          detail: detail.slice(0, 200),
-        });
+      return { file, target: target as { fileId: string; url: string } };
+    });
+    const out: UploadedFile[] = new Array<UploadedFile>(jobs.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(3, jobs.length) }, async () => {
+      for (;;) {
+        const index = next++;
+        if (index >= jobs.length) return;
+        const job = jobs[index]!;
+        // PUT 调用包 try/catch：60s 超时映射为 upstream_timeout（M-10）。
+        let put: Response;
+        try {
+          put = await this.presignPut(job.target.url, {
+            method: "PUT",
+            headers: {
+              "content-type": job.file.mediaType,
+              "content-length": String(job.file.bytes.length),
+            },
+            body: job.file.bytes as unknown as BodyInit,
+            ...(signal ? { signal } : {}),
+          });
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "TimeoutError") {
+            throw new CapyError("upstream_timeout", "附件上传超时", { cause: error });
+          }
+          if (signal?.aborted) throw error;
+          throw new CapyError("upstream_unavailable", `附件上传失败：${errorText(error)}`, { cause: error });
+        }
+        if (!put.ok) {
+          const detail = await put.text().catch(() => "");
+          throw new CapyError("upstream_error", `附件上传失败（HTTP ${put.status}）`, {
+            detail: detail.slice(0, 200),
+          });
+        }
+        out[index] = {
+          fileId: job.target.fileId,
+          name: job.file.name,
+          mediaType: job.file.mediaType,
+          sizeBytes: job.file.bytes.length,
+        };
       }
-      out.push({
-        fileId: target.fileId,
-        name: file.name,
-        mediaType: file.mediaType,
-        sizeBytes: file.bytes.length,
-      });
-    }
+    });
+    await Promise.all(workers);
     return out;
   }
 
@@ -210,4 +265,25 @@ export class CapyPublicClient implements CapyPublicPort {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** 单次 read 的空闲 deadline：超时即 upstream_timeout，不再无限等上游。 */
+async function readWithIdleDeadline<T>(promise: Promise<T>, idleMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new CapyError(
+            "upstream_timeout",
+            `Capy 流超过 ${Math.round(idleMs / 1000)}s 没有数据，已断开`,
+          )),
+          Math.max(1, idleMs),
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

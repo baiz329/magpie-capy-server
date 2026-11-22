@@ -7,6 +7,11 @@ export interface DeviceRuntimePort {
    * 实现负责：加载/配对 credential、连接 tunnel、等待 connected。
    */
   ensure(session: AccountSession, signal?: AbortSignal): Promise<DeviceInfo>;
+  /**
+   * 只读：只看"本进程是否已连上"，绝不配对、不建连、不发网络请求。
+   * 未连接时返回 `{ id: "", name: <配置设备名>, connected: false }`。
+   */
+  peek(session: AccountSession): DeviceInfo;
   close(): void;
 }
 

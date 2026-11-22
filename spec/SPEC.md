@@ -1,6 +1,6 @@
 # SPEC — magpie-Capy
 
-> 状态：v1.0 / V0 可用
+> 状态：v0.3.1
 > 范围：Magpie 的 `capy` provider 插件
 
 ## 1. 项目定位
@@ -102,11 +102,11 @@
 - **FR-2.4 断线**：同一 token 先重连 3 次；只有服务端明确拒绝 token 才重新配对，
   避免网络抖动在账号里堆积半成品设备。
 - **FR-2.5 machine RPC**：
-  - `bash` / `bash_output`（当前用户权限、超时/输出上限）
-  - `read` / `write` / `edit` / `file_read` / `file_write`
-  - `worktree_ensure` / `worktree_list`
-  - `volume_landed` / `volume_probe`
-  - `POST /v1/git/capture`
+  - `bash`（当前用户权限、超时/输出上限；仅 `full` 档，默认关）/ `bash_output`（未实现，返回 `MachineServer.Unavailable`）
+  - `read` / `write` / `edit` / `file_read` / `file_write`（只限工作区内）
+  - `worktree_ensure` / `worktree_list`（`worktree_list` 允许，固定 base 下，只列一级目录）
+  - `volume_landed` / `volume_probe`（未实现，返回 `MachineServer.Unavailable`）
+  - `POST /v1/git/capture`（占位，恒返回 `{repos: []}`）
   - 浏览器 / computer handler → `MachineServer.Unavailable`
 - **FR-2.6 不跨组织**：设备 org 必须与账号 org 一致；不一致 → 明确错误。
 
@@ -119,7 +119,8 @@
 - **FR-3.3 免费优先排序**：免费模型排最前（宿主 `/v1/models` 截断时仍可见）。
 - **FR-3.4 模型解析**：精确 id → `capy/` 前缀剥离 → 短名 → 展示名；未知 → 404。
 - **FR-3.5 能力描述**：Capy `/models` **不返回** image/pdf/tool 能力。插件按通道能力标记：
-  files 通道接受图片/PDF，PromptToolBridge 提供 tools；能力注册表保留 per-model override，
+  files 通道接受图片/PDF，PromptToolBridge 提供 tools；能力注册表保留 per-model override
+  （**未实现，v0.3.1 不做**），
   不把这些标记冒充成 Capy 的模型元数据。
 
 ### FR-4 对话
@@ -130,7 +131,7 @@
 - **FR-4.4 流式输出**：OpenAI `chat.completion.chunk`；`finish_reason:"stop"`；`[DONE]`。
 - **FR-4.5 非流式**：返回完整 `chat.completion`。
 - **FR-4.6 取消**：客户端断开 → `POST /app/.../interrupt`。
-- **FR-4.7 降级**：公共 SSE 不可用 → outline 轮询（仅在必要时）。
+- **FR-4.7 降级**：公共 SSE 不可用 → outline 轮询（仅在必要时）。**未实现（v0.3.1 不做）**：代码里没有 outline 轮询路径，流不可用时直接报错。
 - **FR-4.8 思考档位**：`reasoning_effort` → `model.reasoningMode`；不支持则丢弃。
 - **FR-4.9 上下文预算**：不设本地字符上限。Capy 按 token 管理上下文
   （`GET /app/orgs/{org}/jams/{jam}/events/context-usage` →
@@ -142,8 +143,8 @@
 - **FR-5.1 提取**：`image_url` / `file` / `input_file`（data URL / 公网 URL / 裸 base64）。
 - **FR-5.2 上传**：`POST /api/v1/files` → 预签名 PUT → jam `files[]`。
 - **FR-5.3 限制**：公共 API 规定**单文件最大 250 MB**（`sizeBytes` 上限 262,144,000），
-  文件数没有 API 级上限；不额外发明 8 个/60 MB 之类的本地限制。本机/内网 URL 拒绝（SSRF）。
-- **FR-5.4 缓存**：同 API key + 同字节 1h 复用 `fileId`。
+  文件数没有 API 级上限；插件另有单请求 32 个/128 MiB 的本地限额（插件策略，不是 Capy 的限制）。用户提供的下载 URL 中本机/内网拒绝（SSRF）；Capy 签发的预签名 PUT 目标豁免 DNS 解析判定（仍要求 https:443、0 跳、60s 超时）。
+- **FR-5.4 缓存**：同 API key + 同字节 1h 复用 `fileId`。**未实现（v0.3.1 不做）**：每轮都重新上传，见 README 已知限制。
 
 ### FR-6 额度
 
@@ -162,7 +163,7 @@
 ### FR-8 代理
 
 - 显式代理：`MAGPIE_CAPY_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` → Windows 系统代理。
-- Bun 用 `fetch({proxy})`；代理连接失败 → 本次直连（一次警告）。
+- Bun 用 `fetch({proxy})`；代理连接失败默认直接失败，不静默直连（`MAGPIE_CAPY_PROXY_FALLBACK=direct` 才允许本次直连）。
 - 地区限制按出口 IP，不靠请求头。
 
 ### FR-9 系统提示词
@@ -174,7 +175,7 @@
 ### FR-10 工具
 
 - 默认开启提示词桥：tools → 提示词 → 解析 `tool_calls` JSON。
-- 模型不配合 → 文本 + warning；`MAGPIE_CAPY_TOOL_SHIM=0` 关闭。
+- 模型不配合 → 文本 + warning；`MAGPIE_CAPY_TOOL_SHIM=0` 关闭。**未实现（v0.3.1 不做）**：代码不读取该环境变量，工具桥目前没有环境变量关闭开关。
 - 未来 Capy 若提供原生 tools：实现 `ToolBridge` 适配器，不改 application。
 
 ## 6. 对外 API
@@ -204,7 +205,7 @@ AccountSession {
   accountId, uid, orgId, clientId,
   accessToken,            // capy_…
   clerk: { clientJwt, sessionId },
-  source: "local" | "browser"
+  source: "local" | "browser" | "cookie" | "refresh"
 }
 
 HeadlessCredential {
@@ -214,7 +215,7 @@ HeadlessCredential {
 ModelDescriptor {
   id, name, vendor, free,
   reasoningModes: string[],
-  capabilities: { text, image, attachment, tools }
+  capabilities: { text, image, pdf, attachment, tools }
 }
 
 ChatRequest / ChatEvent / UsageSnapshot / CapyError
@@ -245,7 +246,7 @@ ChatRequest / ChatEvent / UsageSnapshot / CapyError
 - 插件自身开销（在拿到上游帧之后）< 20ms/帧。
 - 不轮询；SSE 首帧立即转发。
 - 设备 ensure 缓存：同一账号同一进程只做一次；断线才重连。
-- 附件上传与线程创建可并行（除依赖顺序外）。
+- 附件上传在线程创建之前（jam 需要 `files[]`，有依赖顺序，不并行）。
 - 大 prompt 不设本地字符上限，交给 Capy 的 token budget/compact；附件用 API 的
   250 MB/文件限制，超限/非法才 400。
 
@@ -253,7 +254,7 @@ ChatRequest / ChatEvent / UsageSnapshot / CapyError
 
 - 上游 5xx/超时 → 可重试错误；客户端断开 → interrupt。
 - 设备重连最多一次重配对。
-- SSE 断线：有 `sawDelta` 不重试；无 delta 才降级轮询。
+- SSE 断线：有 `sawDelta` 不重试；无 delta 才降级轮询（轮询降级**未实现，v0.3.1 不做**）。
 - 所有网络调用有超时与 AbortSignal。
 
 ### 安全
@@ -261,11 +262,12 @@ ChatRequest / ChatEvent / UsageSnapshot / CapyError
 - Secret 只在内存/DPAPI；日志 redaction。
 - 不读非必要的本机文件；本机导入只读指定文件。
 - 公网 URL 下载做 SSRF 防护（私网/本机拒绝）。
+- Capy 签发的预签名 PUT 目标豁免 DNS 解析判定（代理环境下 DNS 可能解析到禁段）；https-only、0 跳、60s 超时仍保留。
 - OAuth/登录窗口使用临时 profile，不碰用户日常浏览器配置。
 
 ### 可观测性
 
-- 结构化事件：`login`, `device.pair`, `device.ready`, `chat.start`, `chat.first_delta`, `chat.done`, `upstream.error`。
+- 结构化事件：`login`, `device.pair`, `device.ready`, `chat.start`, `chat.first_delta`, `chat.done`, `upstream.error`。**未实现（v0.3.1 不做）**：目前只有散落的 `logger.warn`，没有这 7 类结构化事件。
 - 事件字段不含 secret；token 只出现长度/前缀。
 - 可选 metrics 端口；默认只日志。
 
@@ -278,8 +280,8 @@ ChatRequest / ChatEvent / UsageSnapshot / CapyError
 
 ## 11. 未来模型与能力演进
 
-- `ModelDescriptor` + `CapabilityRegistry`：模型能力数据驱动。
-- `ModelPolicy`：free-first / vendor allowlist / context limits，可插拔。
+- `ModelDescriptor` + `CapabilityRegistry`：模型能力数据驱动（`CapabilityRegistry` **未实现，v0.3.1 不做**；`ModelDescriptor` 已实现）。
+- `ModelPolicy`：free-first / vendor allowlist / context limits，可插拔（**未实现，v0.3.1 不做**；只有 `freeFirst` 排序函数，没有可组合的策略对象）。
 - `ToolBridge`：当前 `PromptToolBridge`；未来 `NativeToolBridge` 只替换适配器。
 - `StreamNormalizer`：把不同上游事件（SSE/NDJSON）归一成 `ChatEvent`。
 - 协议版本：`contractVersion` 校验；未知帧忽略；新能力通过 capability 探测。

@@ -2,7 +2,7 @@
 
 ## 状态
 
-Accepted
+Superseded by ADR-009（两框登录取代单框 Cookie 登录，见 ADR-009）
 
 ## 背景
 

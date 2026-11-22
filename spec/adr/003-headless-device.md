@@ -2,7 +2,7 @@
 
 ## 状态
 
-Accepted
+Superseded by ADR-012（2026-11-22：原文“终端/浏览器/写文件等 coding agent 工具不可用”已不成立，v0.3 已实现 bash 与文件写；能力分级与路径隔离见 ADR-012）
 
 ## 背景
 

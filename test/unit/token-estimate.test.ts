@@ -19,17 +19,38 @@ test("estimateTokensOfMessages：抽取文本内容估算", () => {
   expect(tokens).toBe(8);
 });
 
-test("estimateTokensOfMessages：多段内容与图片占位符计入", () => {
+test("estimateTokensOfMessages：图片按张计 85 token（M-04）", () => {
   const tokens = estimateTokensOfMessages([
     {
       role: "user",
       content: [
         { type: "text", text: "look" },
         { type: "image_url", url: "data:image/png;base64,AA==", name: "pic" },
+        { type: "image_url", url: "data:image/png;base64,AA==", name: "pic2" },
       ],
     },
   ]);
-  expect(tokens).toBe(estimateTokens("look[图片: pic]"));
+  expect(tokens).toBe(estimateTokens("look") + 85 * 2);
+});
+
+test("estimateTokensOfMessages：PDF 只按 mediaType 计，URL-only 不计（M-04）", () => {
+  const dataUrl = `data:application/pdf;base64,${"A".repeat(400_000)}`;
+  const pdf = estimateTokensOfMessages([
+    { role: "user", content: [{ type: "file", data: dataUrl, mediaType: "application/pdf" }] },
+  ]);
+  // 400_000 字符 base64 ≈ 300_000 字节 → 3 × 100 token。
+  expect(pdf).toBe(300);
+  const urlOnly = estimateTokensOfMessages([
+    {
+      role: "user",
+      content: [{ type: "file", url: "https://example.test/a-very-long-file-name.pdf", mediaType: "application/pdf" }],
+    },
+  ]);
+  expect(urlOnly).toBe(0);
+  const notPdf = estimateTokensOfMessages([
+    { role: "user", content: [{ type: "file", data: dataUrl, mediaType: "image/png" }] },
+  ]);
+  expect(notPdf).toBe(0);
 });
 
 test("estimateTokensOfMessages：工具调用名称与参数计入", () => {

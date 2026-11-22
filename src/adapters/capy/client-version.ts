@@ -10,7 +10,7 @@
  * 诚实边界：下载页只公布 Capy 自身版本号，不公布内嵌的 Chrome /
  * Electron 版本，所以 UA 里 Chrome/Electron 段只能人工验证，不会自动
  * 刷新。下面两个常量是 2026-11-21 从真实桌面端抓包核实的
- * （spec/capture/desktop-create-jam-2026-11-21.json，app.har entry 0），
+ * （2026-11-21 内部取证，未随仓库分发），
  * 只有 Capy/ 段会随探测刷新。
  */
 
@@ -24,8 +24,10 @@ export const DESKTOP_CHROME_VERSION = "156.0.8078.80";
 export const DESKTOP_ELECTRON_VERSION = "45.2.3";
 /** 探测结果缓存时长（24h）：桌面版本不会频繁变，没必要每次请求都查。 */
 export const DEFAULT_VERSION_TTL_MS = 24 * 60 * 60 * 1000;
-/** 单次探测超时：别让版本探测拖住一次聊天请求。 */
-export const DEFAULT_VERSION_TIMEOUT_MS = 5_000;
+/** 单次探测超时（H-14(4)）：1.5s 足够，别让版本探测拖住一次聊天请求。 */
+export const DEFAULT_VERSION_TIMEOUT_MS = 1_500;
+/** 探测失败后的负缓存时长：5 分钟内不再发请求（H-14(4)）。 */
+export const VERSION_FAILURE_TTL_MS = 5 * 60 * 1000;
 
 const VERSION_RE = /Version\s+(\d+\.\d+\.\d+)/;
 
@@ -62,6 +64,8 @@ export interface DesktopVersionProbeOptions {
   readonly timeoutMs?: number;
   /** 注入时钟（测试用），默认 Date.now。 */
   readonly now?: () => number;
+  /** 失败时只提示一次（可选注入，不裸打 console）。 */
+  readonly onWarn?: (message: string) => void;
 }
 
 /**
@@ -78,6 +82,24 @@ export function createDesktopVersionProbe(options: DesktopVersionProbeOptions = 
 
   let cached: { version: string; atMs: number } | null = null;
   let inFlight: Promise<string> | null = null;
+  /** 失败负缓存：期间不再发请求，直接用旧版本/回退值。 */
+  let negativeUntil = 0;
+  let warned = false;
+
+  function fallbackVersion(): string {
+    return cached?.version ?? FALLBACK_DESKTOP_VERSION;
+  }
+
+  function noteFailure(reason: string): void {
+    negativeUntil = now() + VERSION_FAILURE_TTL_MS;
+    if (warned) return;
+    warned = true;
+    try {
+      options.onWarn?.(`Capy 桌面版本探测失败，回退 ${fallbackVersion()}：${reason}`);
+    } catch {
+      // 日志失败不能影响探测
+    }
+  }
 
   async function probe(): Promise<string> {
     const controller = new AbortController();
@@ -95,14 +117,22 @@ export function createDesktopVersionProbe(options: DesktopVersionProbeOptions = 
         fetchImpl(downloadUrl, { signal: controller.signal }),
         timeout,
       ]);
-      if (!response.ok) return cached?.version ?? FALLBACK_DESKTOP_VERSION;
+      if (!response.ok) {
+        noteFailure(`HTTP ${response.status}`);
+        return fallbackVersion();
+      }
       const html = await response.text();
       const version = parseDesktopVersion(html);
-      if (!version) return cached?.version ?? FALLBACK_DESKTOP_VERSION;
+      if (!version) {
+        noteFailure("下载页没有版本号");
+        return fallbackVersion();
+      }
       cached = { version, atMs: now() };
+      negativeUntil = 0;
       return version;
-    } catch {
-      return cached?.version ?? FALLBACK_DESKTOP_VERSION;
+    } catch (error) {
+      noteFailure(error instanceof Error ? error.message : String(error));
+      return fallbackVersion();
     } finally {
       clearTimeout(timeoutId);
     }
@@ -111,6 +141,7 @@ export function createDesktopVersionProbe(options: DesktopVersionProbeOptions = 
   return {
     async currentVersion(): Promise<string> {
       if (cached && now() - cached.atMs < ttlMs) return cached.version;
+      if (now() < negativeUntil) return fallbackVersion();
       if (inFlight) return inFlight;
       inFlight = probe();
       try {

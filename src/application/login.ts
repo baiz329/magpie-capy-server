@@ -33,7 +33,13 @@ export class LoginUseCase {
     const orgs = await this.options.app.organizations(jwt, signal);
     const orgId = pickOrg(orgs, credential.orgId, me.preferredOrgId);
     if (!orgId) {
-      throw new CapyError("invalid_request", "这个 Capy 账号没有组织（org），请先在 Capy 里完成初始化");
+      // 多组织无偏好 ≠ 没有组织：文案必须诚实（M-18）。
+      throw new CapyError(
+        "invalid_request",
+        orgs.length > 1
+          ? "这个 Capy 账号有多个组织，请先选一个组织再登录（暂不支持在登录时选择组织）"
+          : "这个 Capy 账号没有组织（org），请先在 Capy 里完成初始化",
+      );
     }
     const key = await this.options.app.mintApiKey(
       jwt,
@@ -54,6 +60,8 @@ export class LoginUseCase {
       clerk,
       source: credential.source,
       ...(accountId ? { displayName: accountId } : {}),
+      // 上游返回 keyId 则记录下来（H-14(2)）；没有也不影响登录。
+      ...(key.keyId ? { apiKeyId: key.keyId } : {}),
     };
   }
 }

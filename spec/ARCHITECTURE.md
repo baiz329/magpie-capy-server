@@ -11,7 +11,7 @@
 4. **纯函数核心**：协议解析、消息拍平、错误映射、模型排序都是纯函数；副作用在 adapter。
 5. **事件流优先**：上游 SSE/NDJSON → `ChatEvent` 异步迭代器 → OpenAI SSE encoder。
    测试直接消费事件，不解析字符串。
-6. **无全局单例**：`createApp(deps)` 显式注入 clock/ids/fetch/logger/secretStore。
+6. **无全局单例**：`entry/plugin.ts` 的默认导出在内部直接 new 各 adapter/use case 并显式注入 clock/ids/fetch/logger/secretStore（没有 `createApp(deps)` 工厂）。
 7. **契约先行**：先写协议契约与失败测试，再写 adapter。
 8. **为并行 Agent 设计**：工作包只依赖冻结的 port/type；接口变更走 ADR。
 
@@ -35,8 +35,8 @@
 └───────┬─────────┘ └───────┬─────────┘ └───────┬────────────────┘
         │ adapters          │ adapters          │ adapters
 ┌───────▼─────────┐ ┌───────▼─────────┐ ┌───────▼────────────────┐
-│ capy/app-client │ │ capy/public-... │ │ capy/device-tunnel     │
-│ clerk-client    │ │ sse-parser      │ │ machine-rpc            │
+│ capy/app-client │ │ capy/public-    │ │ capy/device-tunnel     │
+│ clerk-client    │ │ client          │ │ machine RPC inside     │
 └─────────────────┘ └─────────────────┘ └────────────────────────┘
 
 domain: AccountSession, ModelDescriptor, ChatRequest/Event, CapyError, Usage
@@ -55,8 +55,10 @@ src/
     catalog.ts             # live /models + 静态兜底
     chat.ts                # jam → SSE → ChatEvent
     device.ts              # 每账号 single-flight
+    key-hash.ts            # 账号 key 哈希
     login.ts               # Clerk → org → API key
     stream.ts              # Public SSE 归一
+    tool-sniff.ts          # 流式工具前缀嗅探
     tools.ts               # PromptToolBridge
     usage.ts               # balance/token 窗口
   domain/
@@ -64,6 +66,7 @@ src/
     chat.ts
     errors.ts
     model.ts
+    net.ts
     usage.ts
   ports/
     capy-app.ts
@@ -77,9 +80,13 @@ src/
       app-client.ts
       browser-login.ts
       clerk-client.ts
+      client-version.ts
+      cookie-login.ts
       device-tunnel.ts
       endpoints.ts
       local-login.ts
+      machine-capability.ts
+      machine-path.ts
       public-client.ts
       static-catalog.ts
     host/
@@ -87,10 +94,12 @@ src/
     platform/
       console-logger.ts
       dpapi.ts
+      guarded-fetch.ts
       http.ts
       memory-cache.ts
       proxy-fetch.ts
       system-clock.ts
+      token-estimate.ts
       ulid.ts
   protocol/
     openai.ts
@@ -218,12 +227,12 @@ Upstream SSE frame → protocol/sse parse → StreamNormalizer
 - `assistant` 帧：按 `callId` 累积；重复全文用前缀去重。
 - `transcript(source=assistant)`：最终文本校正。
 - `turn(dropped)`：丢弃 live 片段（transcript 为准）。
-- 无 delta 时才允许轮询 fallback。
+- 无 delta 时才允许轮询 fallback（**未实现，v0.3.1 不做**）。
 
 ## 8. 模型能力与未来扩展
 
-- `ModelDescriptor` 来自 catalog；`CapabilityRegistry` 把 descriptor → OpenAI capabilities。
-- `ModelPolicy`：
+- `ModelDescriptor` 来自 catalog；`CapabilityRegistry` 把 descriptor → OpenAI capabilities（`CapabilityRegistry` **未实现，v0.3.1 不做**；只有 `describeModel()` 的通道能力标记）。
+- `ModelPolicy`（**未实现，v0.3.1 不做**；只有 `freeFirst()` 排序，没有可组合的策略对象）：
   - `freeFirst()`
   - `vendorAllowlist()`
   - `contextBudget()`
@@ -242,7 +251,7 @@ Upstream SSE frame → protocol/sse parse → StreamNormalizer
 2. **单一真相**：协议在 `CONTRACTS.md`，自定值在 `AUDIT.md`；不要靠猜测补协议。
 3. **无共享可变状态**：模块之间只通过 port/值对象。
 4. **小 PR**：一个改动只做一件事；不跨层“顺手重构”。
-5. **主分支保护**：`bun test` + `bun run typecheck` + `bun run build` 必须绿。
+5. **发布验收（本地人工）**：发版前人工跑 `bun test` + `bun run typecheck` + `bun run build`，全绿才发版；CI 明确不做。
 6. **ADR**：改接口/协议/错误码先写 ADR，再改代码。
 
 ## 10. 构建与运行
@@ -254,7 +263,7 @@ Upstream SSE frame → protocol/sse parse → StreamNormalizer
   - `type: module`
   - `magpie` 元数据
 - provider id：`capy`（ADR-007）；`MAGPIE_CAPY_PROVIDER_ID` 可覆盖。
-- 零运行时依赖（只用 Bun/Node/Web 标准库）。
+- 零 npm 运行时依赖（只用 Bun/Node/Web 标准库；另需 bash / PowerShell，见 README）。
 
 ## 11. 为什么没有数据库/前端
 

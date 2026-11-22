@@ -13,7 +13,7 @@ Accepted
 
 - **没有数据库、没有队列、没有后台 worker。**
 - 账号状态：Host 的 auth record。
-- 设备 token：`%LOCALAPPDATA%\magpie-capy\headless-device.json`（DPAPI）。
+- 设备 token：`%LOCALAPPDATA%\magpie-capy\headless-<accountKey>.json`（DPAPI；按账号分文件）。
 - 其余缓存：进程内 TTL Map，经 `CachePort`；进程重启即失效。
 - 所有持久化通过 `SecretStorePort`，便于未来替换。
 

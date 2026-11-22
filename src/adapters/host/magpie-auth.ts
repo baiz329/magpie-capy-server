@@ -1,5 +1,30 @@
-import type { AccountSession } from "../../domain/account.ts";
+import { createHash } from "node:crypto";
+
+import type { AccountSession, LoginSource } from "../../domain/account.ts";
 import { CapyError } from "../../domain/errors.ts";
+
+const LOGIN_SOURCES: readonly LoginSource[] = ["local", "browser", "cookie", "refresh"];
+
+/** 显式"取第一个非空字符串"，取代原来永不生效的 `??` 链（M-08）。 */
+function firstNonEmpty(...values: readonly unknown[]): string {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
+/** source 从 metadata 读回；不是已知来源时回退 refresh（M-08）。 */
+function sourceOf(metadata: Record<string, unknown>): LoginSource {
+  const raw = typeof metadata.source === "string" ? metadata.source.trim().toLowerCase() : "";
+  return (LOGIN_SOURCES as readonly string[]).includes(raw) ? raw as LoginSource : "refresh";
+}
+
+/** access token 不适合当账号名时的稳定短标识（不泄漏 token 尾部）。 */
+function shortHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 8);
+}
 
 interface StoredRefresh {
   readonly clientJwt: string;
@@ -39,28 +64,34 @@ export function sessionOfAuth(auth: unknown): AccountSession {
   const metadata = record.metadata && typeof record.metadata === "object" && !Array.isArray(record.metadata)
     ? record.metadata as Record<string, unknown>
     : {};
-  const orgId = refresh.orgId
-    ?? (typeof metadata.orgId === "string" ? metadata.orgId : "");
+  const orgId = firstNonEmpty(refresh.orgId, metadata.orgId);
   if (!orgId) throw new CapyError("sign_in_required", "Capy 登录态缺少组织，请重新登录");
-  const uid = refresh.userId
-    ?? (typeof metadata.userId === "string" ? metadata.userId : "")
-    ?? (typeof record.uid === "string" ? record.uid : "");
-  const accountId = typeof record.accountId === "string" && record.accountId
-    ? record.accountId
-    : uid || access.slice(-8);
+  // uid 回退链恢复 record.uid 到末位（M-08：原来 `??` 链里 "" 截断了它）。
+  const uid = firstNonEmpty(refresh.userId, metadata.userId, record.uid);
+  const accountId = firstNonEmpty(record.accountId) || uid || shortHash(access);
+  const apiKeyId = typeof metadata.keyId === "string" ? metadata.keyId : "";
   return {
     accountId,
     uid,
     orgId,
-    clientId: refresh.clientId ?? (typeof metadata.clientId === "string" ? metadata.clientId : ""),
+    clientId: firstNonEmpty(refresh.clientId, metadata.clientId),
     accessToken: access,
     clerk: { clientJwt: refresh.clientJwt, sessionId: refresh.sessionId },
-    source: "refresh",
+    source: sourceOf(metadata),
     ...(typeof metadata.name === "string" && metadata.name ? { displayName: metadata.name } : {}),
+    ...(apiKeyId ? { apiKeyId } : {}),
   };
 }
 
-export function authRecordOf(session: AccountSession): Record<string, unknown> {
+export interface AuthRecordOptions {
+  /** 覆盖默认的 expires（refresh 只更新过期时间，保留其它字段）。 */
+  readonly expires?: number;
+}
+
+export function authRecordOf(
+  session: AccountSession,
+  options: AuthRecordOptions = {},
+): Record<string, unknown> {
   return {
     type: "success",
     access: session.accessToken,
@@ -72,7 +103,7 @@ export function authRecordOf(session: AccountSession): Record<string, unknown> {
       userId: session.uid,
       clientId: session.clientId,
     }),
-    expires: Date.now() + 7 * 24 * 3600_000,
+    expires: options.expires ?? Date.now() + 7 * 24 * 3600_000,
     accountId: session.accountId,
     uid: session.uid,
     metadata: {
@@ -81,6 +112,7 @@ export function authRecordOf(session: AccountSession): Record<string, unknown> {
       orgId: session.orgId,
       clientId: session.clientId,
       source: session.source,
+      ...(session.apiKeyId ? { keyId: session.apiKeyId } : {}),
     },
   };
 }

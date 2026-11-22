@@ -1,6 +1,6 @@
 import type { ClerkSession } from "../../domain/account.ts";
 import { CapyError } from "../../domain/errors.ts";
-import { requestJson } from "../platform/http.ts";
+import { parseRetryAfterMs, requestJson } from "../platform/http.ts";
 import { CAPY_FAPI, CAPY_ORIGIN } from "./endpoints.ts";
 
 export class ClerkClient {
@@ -26,10 +26,27 @@ export class ClerkClient {
       ...(signal ? { signal } : {}),
     }, 20_000);
     if (!response.ok) {
+      // Clerk 错误按状态码分类（H-14(3)）：429/5xx 不是登录失效，
+      // 不能一律映射成 sign_in_required。
+      const detail = text.slice(0, 200);
+      if (response.status === 429) {
+        const retryAfter = parseRetryAfterMs(response.headers.get("retry-after"));
+        throw new CapyError("rate_limited", "Clerk 限流（HTTP 429），请稍后重试", {
+          detail,
+          ...(retryAfter !== null ? { retryAfterMs: retryAfter } : {}),
+        });
+      }
+      if (response.status >= 500) {
+        throw new CapyError(
+          "upstream_unavailable",
+          `Clerk 服务异常（HTTP ${response.status}），请稍后重试`,
+          { detail },
+        );
+      }
       throw new CapyError(
         "sign_in_required",
         `Capy 会话换票失败（HTTP ${response.status}），请重新登录`,
-        { detail: text.slice(0, 200) },
+        { detail },
       );
     }
     const record = body as { jwt?: unknown; response?: { jwt?: unknown } } | null;

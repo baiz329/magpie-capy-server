@@ -6,6 +6,7 @@ import path from "node:path";
 
 import { CapyError } from "../../domain/errors.ts";
 import type { LoginCredential, LoginSourcePort } from "../../ports/login.ts";
+import type { LoggerPort } from "../../ports/platform.ts";
 import { readCapyInstall } from "./local-login.ts";
 
 const LOGIN_URL = "https://capy.ai/sign-in";
@@ -123,6 +124,23 @@ async function waitPort(port: number, signal: AbortSignal, timeoutMs: number): P
   return false;
 }
 
+/**
+ * 只信任 capy.ai / clerk.capy.ai 的 https 页面。
+ * 没匹配到就继续轮询到超时，**不要**退回"第一个任意页面"。
+ */
+export function isCapyPageUrl(raw: unknown): boolean {
+  const text = String(raw ?? "").trim();
+  if (!text) return false;
+  try {
+    const url = new URL(text);
+    if (url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase();
+    return host === "capy.ai" || host === "clerk.capy.ai" || host.endsWith(".capy.ai");
+  } catch {
+    return false;
+  }
+}
+
 async function connectPage(port: number, signal: AbortSignal, timeoutMs: number): Promise<CdpConnection> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -132,7 +150,9 @@ async function connectPage(port: number, signal: AbortSignal, timeoutMs: number)
       const page = list.find((item) => {
         if (!item || typeof item !== "object") return false;
         const record = item as Record<string, unknown>;
-        return record.type === "page" && typeof record.webSocketDebuggerUrl === "string";
+        return record.type === "page"
+          && typeof record.webSocketDebuggerUrl === "string"
+          && isCapyPageUrl(record.url);
       }) as Record<string, unknown> | undefined;
       if (page && typeof page.webSocketDebuggerUrl === "string") {
         const ws = new WebSocket(page.webSocketDebuggerUrl);
@@ -193,6 +213,13 @@ const SELECTED_ORG = `(() => {
   } catch { return ""; }
 })()`;
 
+/** `__client` 必须是 capy 域的 cookie：临时 profile 里可能混入其它站点的同名 cookie。 */
+export function isCapyCookieDomain(raw: unknown): boolean {
+  const domain = String(raw ?? "").trim().toLowerCase().replace(/^\./u, "");
+  if (!domain) return false;
+  return domain === "capy.ai" || domain === "clerk.capy.ai" || domain.endsWith(".capy.ai");
+}
+
 async function readCookie(cdp: CdpConnection): Promise<string> {
   for (const method of ["Network.getAllCookies", "Storage.getCookies"] as const) {
     let result: unknown;
@@ -202,7 +229,9 @@ async function readCookie(cdp: CdpConnection): Promise<string> {
     for (const cookie of cookies) {
       if (!cookie || typeof cookie !== "object") continue;
       const value = cookie as Record<string, unknown>;
-      if (value.name === "__client" && typeof value.value === "string") return value.value;
+      if (value.name !== "__client" || typeof value.value !== "string") continue;
+      if (!isCapyCookieDomain(value.domain)) continue;
+      return value.value;
     }
   }
   return "";
@@ -268,6 +297,7 @@ async function chromiumLogin(options: {
   readonly browser?: string;
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
+  readonly logger?: LoggerPort;
 } = {}): Promise<LoginCredential> {
   const exe = options.browser || findBrowser();
   if (!exe) {
@@ -349,19 +379,34 @@ async function chromiumLogin(options: {
     throw new CapyError("upstream_timeout", "等待 Capy 浏览器登录超时，请重试");
   } finally {
     try { child?.kill("SIGTERM"); } catch {}
-    setTimeout(() => {
-      try { fs.rmSync(profile, { recursive: true, force: true }); } catch {}
-    }, 1000).unref?.();
+    // 临时 profile 里可能有 Cookie：同步删，带重试（Windows 上浏览器句柄释放有延迟）。
+    try {
+      fs.rmSync(profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    } catch (error) {
+      // 删不掉必须留痕；消息里只有路径，没有凭据。走 LoggerPort，不裸 console.warn。
+      options.logger?.warn("browser profile cleanup failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 }
 
 export class CapyLoginSources implements LoginSourcePort {
+  private readonly logger: LoggerPort | undefined;
+
+  constructor(logger?: LoggerPort) {
+    this.logger = logger;
+  }
+
   async local(): Promise<LoginCredential> {
     return readCapyInstall();
   }
 
   async browser(signal?: AbortSignal): Promise<LoginCredential> {
-    return chromiumLogin({ ...(signal ? { signal } : {}) });
+    return chromiumLogin({
+      ...(signal ? { signal } : {}),
+      ...(this.logger ? { logger: this.logger } : {}),
+    });
   }
 }
 

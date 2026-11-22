@@ -62,3 +62,30 @@ test("catalog：401 不被静态兜底掩盖", async () => {
   });
   await expect(useCase.load("capy_key")).rejects.toMatchObject({ kind: "sign_in_required" });
 });
+
+test("catalog：缓存键是密钥哈希，不含 apiKey 明文片段（M-05）", async () => {
+  const seenKeys: string[] = [];
+  const recordingCache = {
+    get<T>(key: string): T | undefined {
+      seenKeys.push(key);
+      return undefined;
+    },
+    set<T>(key: string, _value: T, _ttlMs: number): void {
+      seenKeys.push(key);
+    },
+    delete(): void {},
+    clear(): void {},
+  };
+  const useCase = new CatalogUseCase({
+    publicPort: publicPort(),
+    fallback: [],
+    toolsEnabled: true,
+    cache: recordingCache,
+  });
+  await useCase.load("capy_SECRETKEY1234567890");
+  expect(seenKeys.length).toBeGreaterThan(0);
+  for (const key of seenKeys) {
+    expect(key).not.toContain("SECRETKEY");
+    expect(key).not.toContain("1234567890");
+  }
+});

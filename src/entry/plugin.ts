@@ -7,8 +7,9 @@ import { HeadlessDeviceRuntime, FileSecretStore } from "../adapters/capy/device-
 import { CAPY_PUBLIC } from "../adapters/capy/endpoints.ts";
 import { CapyPublicClient } from "../adapters/capy/public-client.ts";
 import { ConsoleLogger } from "../adapters/platform/console-logger.ts";
+import { createGuardedFetch } from "../adapters/platform/guarded-fetch.ts";
 import { MemoryCache } from "../adapters/platform/memory-cache.ts";
-import { createProxyFetch, resolveProxyUrl } from "../adapters/platform/proxy-fetch.ts";
+import { createProxyFetch, describeProxy, resolveProxyUrl } from "../adapters/platform/proxy-fetch.ts";
 import { SystemClock } from "../adapters/platform/system-clock.ts";
 import { estimateTokens, estimateTokensOfMessages } from "../adapters/platform/token-estimate.ts";
 import { SystemIds } from "../adapters/platform/ulid.ts";
@@ -18,10 +19,12 @@ import { collectAttachments } from "../application/attachments.ts";
 import { DeviceUseCase } from "../application/device.ts";
 import { CatalogUseCase } from "../application/catalog.ts";
 import { ChatUseCase } from "../application/chat.ts";
+import { MinimalVariantGate } from "../application/minimal-gate.ts";
 import { LoginUseCase } from "../application/login.ts";
+import { sniffToolPrefix } from "../application/tool-sniff.ts";
 import { PromptToolBridge } from "../application/tools.ts";
 import { UsageUseCase, withDeviceWindow } from "../application/usage.ts";
-import type { AccountSession } from "../domain/account.ts";
+import { accountKey, type AccountSession } from "../domain/account.ts";
 import type { ChatEvent, ChatRequest } from "../domain/chat.ts";
 import { CapyError } from "../domain/errors.ts";
 import {
@@ -48,6 +51,14 @@ const DEFAULT_PROVIDER_ID = "capy";
 const SDK = "@ai-sdk/openai-compatible";
 const MAX_CONCURRENCY = 2;
 const REFRESH_LEAD_MS = 24 * 3600_000;
+/** 请求体上限 2MB（P3-09）：流式累计校验，超限即 413。 */
+const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
+/** OpenAI 兼容参数里本插件不支持、以前静默吞掉的（P3-09）：至少打一条 warn。 */
+const UNSUPPORTED_PARAMS = [
+  "temperature", "top_p", "max_tokens", "max_completion_tokens",
+  "presence_penalty", "frequency_penalty", "logit_bias", "stop",
+  "n", "seed", "response_format", "logprobs", "user",
+] as const;
 
 interface PluginOptions {
   readonly providerId?: string;
@@ -128,12 +139,54 @@ function staticModels(providerId: string, toolsEnabled: boolean): Record<string,
   return modelMap(models, providerId, toolsEnabled);
 }
 
+function assertBodySize(bytes: number): void {
+  if (bytes > MAX_REQUEST_BODY_BYTES) {
+    throw new CapyError("invalid_request", "请求体超过 2MB 上限", { status: 413 });
+  }
+}
+
+async function readBodyText(input: Request | string | URL, init: RequestInit): Promise<string> {
+  if (typeof init.body === "string") {
+    assertBodySize(Buffer.byteLength(init.body));
+    return init.body;
+  }
+  if (init.body instanceof Uint8Array) {
+    assertBodySize(init.body.byteLength);
+    return new TextDecoder().decode(init.body);
+  }
+  const stream = init.body
+    ? new Response(init.body as BodyInit).body
+    : input instanceof Request
+      ? input.body
+      : null;
+  if (!stream) return "";
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > MAX_REQUEST_BODY_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      throw new CapyError("invalid_request", "请求体超过 2MB 上限", { status: 413 });
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
 async function readJsonBody(input: Request | string | URL, init: RequestInit): Promise<unknown> {
-  if (typeof init.body === "string") return JSON.parse(init.body);
-  if (init.body instanceof Uint8Array) return JSON.parse(new TextDecoder().decode(init.body));
-  if (init.body) return JSON.parse(await new Response(init.body as BodyInit).text());
-  if (input instanceof Request) return JSON.parse(await input.text());
-  return {};
+  const text = await readBodyText(input, init);
+  if (!text.trim()) return {};
+  return JSON.parse(text);
 }
 
 function loginErrorText(error: unknown): string {
@@ -150,30 +203,48 @@ export default async function CapyNextPlugin(
   const configuredVariant = String(
     options.promptVariant ?? process.env.MAGPIE_CAPY_PROMPT_VARIANT ?? "auto",
   ).trim().toLowerCase();
-  let minimalUnsupported = configuredVariant === "default" || configuredVariant === "off";
+  // minimal 是否不可用按账号记（H-13(1)）：一个账号降级不拖累其它账号。
+  const minimalGate = new MinimalVariantGate(
+    configuredVariant === "default" || configuredVariant === "off",
+  );
+
+  // logger 先建：proxy / UA 探测 / token 存储的 warn 都走 logger（脱敏 + 结构化），
+  // 不再有裸 console.warn（H-02/H-04）。
+  const clock = new SystemClock();
+  const ids = new SystemIds();
+  const logger = new ConsoleLogger("capy");
+  /** refresh 的 single-flight（按 accountKey，H-14(2)）。 */
+  const refreshInflight = new Map<string, Promise<Record<string, unknown> | undefined>>();
 
   const proxyUrl = resolveProxyUrl({
     ...(options.proxy === undefined ? {} : { proxy: options.proxy }),
   });
   const fetchImpl = createProxyFetch(fetch, proxyUrl, {
-    onWarn: (message) => console.warn(`[magpie-capy] ${message}`),
+    onWarn: (message) => logger.warn(message),
+  });
+  if (proxyUrl) logger.event("proxy_enabled", { proxy: describeProxy(proxyUrl) });
+
+  /**
+   * 附件下载专用 fetch（H-01）：直连、不经用户代理，逐跳重校验 DNS/端口/协议。
+   * 上游流量仍走上面可能带代理的 fetchImpl。
+   */
+  const attachmentFetch = createGuardedFetch(fetch, {
+    maxRedirects: 3,
+    timeoutMs: 15_000,
+    allowPorts: [80, 443],
+    onBlock: (reason) => logger.warn("attachment fetch blocked", { reason }),
   });
 
-  const clock = new SystemClock();
-  const ids = new SystemIds();
-  const logger = new ConsoleLogger("capy");
-  if (proxyUrl) {
-    let host = "configured";
-    try { const parsed = new URL(proxyUrl); host = `${parsed.hostname}:${parsed.port || "default"}`; } catch {}
-    logger.event("proxy_enabled", { proxy: host });
-  }
   const cache = new MemoryCache(() => clock.now());
-  const app = new CapyAppClient(fetchImpl, undefined, createDesktopVersionProbe({ fetchImpl }));
+  const app = new CapyAppClient(fetchImpl, undefined, createDesktopVersionProbe({
+    fetchImpl,
+    onWarn: (message) => logger.warn(message),
+  }));
   const publicApi = new CapyPublicClient(fetchImpl);
-  const store = new FileSecretStore();
+  const store = new FileSecretStore(undefined, { onWarn: (message) => logger.warn(message) });
   const runtime = new HeadlessDeviceRuntime({ app, store, clock, logger });
   const device = new DeviceUseCase(runtime);
-  const login = new LoginUseCase({ app, sources: new CapyLoginSources() });
+  const login = new LoginUseCase({ app, sources: new CapyLoginSources(logger) });
   const catalog = new CatalogUseCase({
     publicPort: publicApi,
     fallback: STATIC_CATALOG,
@@ -231,7 +302,7 @@ export default async function CapyNextPlugin(
                 try {
                   return await probe;
                 } catch (error) {
-                  return { type: "failed", error: loginErrorText(error) };
+                  return { type: "failed", error: redact(loginErrorText(error)) };
                 }
               },
             };
@@ -261,7 +332,7 @@ export default async function CapyNextPlugin(
                 try {
                   return await probe;
                 } catch (error) {
-                  return { type: "failed", error: loginErrorText(error) };
+                  return { type: "failed", error: redact(loginErrorText(error)) };
                 } finally {
                   callbackOptions.signal?.removeEventListener("abort", onAbort);
                   controller.abort();
@@ -317,27 +388,47 @@ export default async function CapyNextPlugin(
         } catch {
           throw Object.assign(new Error("Capy 登录已失效，请重新登录"), { signIn: "expired" });
         }
+        // 同一账号的并发 refresh 只做一次（H-14(2)）；用完即删，不留全局可变状态。
+        const key = accountKey(session);
+        const inFlight = refreshInflight.get(key);
+        if (inFlight) return inFlight;
+        const task = (async (): Promise<Record<string, unknown> | undefined> => {
+          // 先验 Clerk 会话本身，不只验 API key（H-14(3)）：
+          // Clerk 已失效 → 走 complete() 重新登录；Clerk 暂时不可用 → 不判定失效，等下次 refresh。
+          let clerkValid = true;
+          try {
+            await app.sessionJwt(session.clerk);
+          } catch (error) {
+            if (error instanceof CapyError && error.kind === "sign_in_required") clerkValid = false;
+            else return undefined;
+          }
+          if (clerkValid) {
+            try {
+              await publicApi.listModels(session.accessToken);
+              // key 仍有效：只续过期时间，返回完整记录（不丢 metadata/uid/keyId）。
+              return authRecordOf(session, { expires: Date.now() + 7 * 24 * 3600_000 });
+            } catch (error) {
+              if (!(error instanceof CapyError) || error.kind !== "sign_in_required") return undefined;
+            }
+          }
+          try {
+            return await complete({
+              clientJwt: session.clerk.clientJwt,
+              sessionId: session.clerk.sessionId,
+              userId: session.uid,
+              orgId: session.orgId,
+              clientId: session.clientId,
+              source: "refresh",
+            });
+          } catch {
+            throw Object.assign(new Error("Capy 登录已失效，请重新登录"), { signIn: "expired" });
+          }
+        })();
+        refreshInflight.set(key, task);
         try {
-          await publicApi.listModels(session.accessToken);
-          return { access: session.accessToken, expires: Date.now() + 7 * 24 * 3600_000 };
-        } catch (error) {
-          if (!(error instanceof CapyError) || error.kind !== "sign_in_required") return undefined;
-        }
-        try {
-          const renewed = await complete({
-            clientJwt: session.clerk.clientJwt,
-            sessionId: session.clerk.sessionId,
-            userId: session.uid,
-            orgId: session.orgId,
-            clientId: session.clientId,
-            source: "refresh",
-          });
-          return {
-            access: typeof renewed.access === "string" ? renewed.access : "",
-            expires: typeof renewed.expires === "number" ? renewed.expires : Date.now() + 7 * 24 * 3600_000,
-          };
-        } catch {
-          throw Object.assign(new Error("Capy 登录已失效，请重新登录"), { signIn: "expired" });
+          return await task;
+        } finally {
+          if (refreshInflight.get(key) === task) refreshInflight.delete(key);
         }
       },
 
@@ -354,6 +445,7 @@ export default async function CapyNextPlugin(
             } catch (error) {
               return encodeErrorResponse(error);
             }
+            const key = accountKey(session);
             const request = input instanceof Request ? input : null;
             const url = typeof input === "string"
               ? input
@@ -375,14 +467,26 @@ export default async function CapyNextPlugin(
               if (!/\/chat\/completions$/u.test(route)) {
                 return encodeErrorResponse(new CapyError("not_implemented", `该端点没有实现：${method} ${url}`));
               }
+              // 非 POST 拒 405（P3-09）。
+              if (method !== "POST") {
+                return encodeErrorResponse(new CapyError("invalid_request", "chat/completions 只支持 POST", { status: 405 }));
+              }
 
               let body: unknown;
               try {
                 body = await readJsonBody(input, init);
-              } catch {
+              } catch (error) {
+                // 413 等 CapyError 原样透传；只有 JSON 解析失败才报"不是合法 JSON"。
+                if (error instanceof CapyError) return encodeErrorResponse(error);
                 return encodeErrorResponse(new CapyError("invalid_request", "请求体不是合法 JSON"));
               }
               const requestBody: ChatRequest = parseChatRequest(body);
+              // 不支持的参数至少打一条 warn，不再静默吞掉（P3-09）。
+              if (body !== null && typeof body === "object" && !Array.isArray(body)) {
+                const raw = body as Record<string, unknown>;
+                const ignored = UNSUPPORTED_PARAMS.filter((name) => raw[name] !== undefined);
+                if (ignored.length > 0) logger.warn("请求里不支持的参数已忽略", { params: ignored.join(",") });
+              }
               // 上游不返回用量；非流式 completion 用估算值上报（近似，非精确计数）。
               const promptTokens = estimateTokensOfMessages(requestBody.messages);
               const snapshot = await catalog.load(session.accessToken, signal);
@@ -391,6 +495,7 @@ export default async function CapyNextPlugin(
               const reasoningMode = reasoningModeOf(requestBody, model);
               const prepared = await collectAttachments(requestBody.messages, {
                 fetchImpl,
+                directFetch: attachmentFetch,
                 ...(signal ? { signal } : {}),
               });
               const files = prepared.attachments.length > 0
@@ -401,57 +506,70 @@ export default async function CapyNextPlugin(
                 if (activeThreadId) void chat.cancel(session, activeThreadId);
               };
               signal?.addEventListener("abort", onAbort, { once: true });
-              const events = chat.stream(session, {
-                ...requestBody,
-                messages: prepared.messages,
-              }, {
-                ...(signal ? { signal } : {}),
-                ...(reasoningMode ? { reasoningMode } : {}),
-                ...(files.length > 0 ? { files } : {}),
-                onThread: (thread) => { activeThreadId = thread.id; },
-                onVariantFallback: () => { minimalUnsupported = true; },
-                ...(minimalUnsupported ? {} : { promptVariant: "minimal" as const }),
-              });
-              const meta = {
-                id: `chatcmpl-${ids.ulid()}`,
-                model: modelId,
-                created: Math.floor(clock.now() / 1000),
-              };
+              try {
+                const events = chat.stream(session, {
+                  ...requestBody,
+                  messages: prepared.messages,
+                }, {
+                  ...(signal ? { signal } : {}),
+                  modelId,
+                  ...(reasoningMode ? { reasoningMode } : {}),
+                  ...(files.length > 0 ? { files } : {}),
+                  onThread: (thread) => { activeThreadId = thread.id; },
+                  onVariantFallback: () => { minimalGate.markUnsupported(key); },
+                  ...(minimalGate.isUnsupported(key) ? {} : { promptVariant: "minimal" as const }),
+                });
+                const meta = {
+                  id: `chatcmpl-${ids.ulid()}`,
+                  model: modelId,
+                  created: Math.floor(clock.now() / 1000),
+                };
 
-              const wantsTools = toolsEnabled && (requestBody.tools?.length ?? 0) > 0;
-              if (wantsTools) {
-                const text = await textOf(events);
-                const parsed = text ? tools.parse(text) : null;
-                if (parsed) {
-                  const calls = parsed.calls.map((call) => ({
-                    id: `call_${ids.ulid()}`,
-                    name: call.name,
-                    arguments: call.arguments,
-                  }));
-                  return requestBody.stream
-                    ? encodeToolCallStream(meta, calls, {
+                const allowedNames = (requestBody.tools ?? []).map((tool) => tool.function.name);
+                const wantsTools = toolsEnabled && (requestBody.tools?.length ?? 0) > 0;
+                if (wantsTools) {
+                  // 带 tools 且 stream 时走前缀嗅探，不再先全缓冲（H-12/M-11）。
+                  const sniffed = await sniffToolPrefix(events, allowedNames);
+                  if (sniffed.kind === "tool") {
+                    const calls = sniffed.calls.map((call) => ({
+                      id: `call_${ids.ulid()}`,
+                      name: call.name,
+                      arguments: call.arguments,
+                    }));
+                    const completionTokens = estimateTokens(calls.map((call) => `${call.name}${call.arguments}`).join(""));
+                    return requestBody.stream
+                      ? encodeToolCallStream(meta, calls, { promptTokens, completionTokens })
+                      : encodeToolCallCompletion(meta.id, meta.model, meta.created, calls, { promptTokens, completionTokens });
+                  }
+                  if (requestBody.stream) {
+                    return encodeChatStream(sniffed.events, meta, {
                       promptTokens,
-                      completionTokens: estimateTokens(calls.map((call) => `${call.name}${call.arguments}`).join("")),
-                    })
-                    : encodeToolCallCompletion(meta.id, meta.model, meta.created, calls, {
-                      promptTokens,
-                      completionTokens: estimateTokens(calls.map((call) => `${call.name}${call.arguments}`).join("")),
-                    });
-                }
-                return requestBody.stream
-                  ? encodeChatStream(textEvents(text), meta, { promptTokens, estimateCompletionTokens: estimateTokens })
-                  : encodeCompletion(meta.id, meta.model, meta.created, text, {
+                      estimateCompletionTokens: estimateTokens,
+                    }, () => { if (activeThreadId) void chat.cancel(session, activeThreadId); });
+                  }
+                  const text = await textOf(sniffed.events);
+                  return encodeCompletion(meta.id, meta.model, meta.created, text, {
                     promptTokens,
                     completionTokens: estimateTokens(text),
                   });
-              }
+                }
 
-              if (requestBody.stream) return encodeChatStream(events, meta, { promptTokens, estimateCompletionTokens: estimateTokens });
-              const text = await textOf(events);
-              return encodeCompletion(meta.id, meta.model, meta.created, text, {
-                promptTokens,
-                completionTokens: estimateTokens(text),
-              });
+                if (requestBody.stream) {
+                  return encodeChatStream(events, meta, {
+                    promptTokens,
+                    estimateCompletionTokens: estimateTokens,
+                  }, () => { if (activeThreadId) void chat.cancel(session, activeThreadId); });
+                }
+                const text = await textOf(events);
+                return encodeCompletion(meta.id, meta.model, meta.created, text, {
+                  promptTokens,
+                  completionTokens: estimateTokens(text),
+                });
+              } finally {
+                // abort 监听只在请求处理期间有效，返回后即移除（M-11）；
+                // 流式取消改走 encodeChatStream 的 onCancel。
+                signal?.removeEventListener("abort", onAbort);
+              }
             } catch (error) {
               return encodeErrorResponse(error);
             }
@@ -468,19 +586,15 @@ export default async function CapyNextPlugin(
         }
         try {
           const snapshot = await usage.load(session.accessToken);
-          let deviceWindow: { connected: boolean; name: string } = { connected: false, name: "" };
-          try {
-            const info = await device.ensure(session);
-            deviceWindow = { connected: true, name: info.name };
-          } catch {
-            deviceWindow = { connected: false, name: "" };
-          }
+          // 只读快照：usage 绝不触发设备配对/建连（H-14(5)）。
+          const info = device.peek(session);
+          const deviceWindow = { connected: info.connected, name: info.connected ? info.name : "" };
           return withDeviceWindow(snapshot, deviceWindow);
         } catch (error) {
           if (error instanceof CapyError && error.kind === "sign_in_required") {
             return { error: "Capy 登录已失效，请重新登录", windows: [], signIn: "expired" };
           }
-          return { error: loginErrorText(error), windows: [] };
+          return { error: redact(loginErrorText(error)), windows: [] };
         }
       },
     },
@@ -495,12 +609,12 @@ export default async function CapyNextPlugin(
         }
       },
     },
-  };
-}
 
-async function* textEvents(text: string): AsyncIterable<ChatEvent> {
-  if (text) yield { type: "delta", text };
-  yield { type: "done" };
+    /** 关掉设备隧道（M-15）：宿主卸载插件时调用，不留悬空 socket。 */
+    dispose() {
+      device.close();
+    },
+  };
 }
 
 async function textOf(events: AsyncIterable<ChatEvent>): Promise<string> {

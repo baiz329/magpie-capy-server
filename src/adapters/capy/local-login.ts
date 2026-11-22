@@ -29,6 +29,18 @@ function readJson(file: string, label: string): Record<string, unknown> {
   }
 }
 
+/** 可选文件：缺失/损坏都不算失败（M-06：device-credentials.json 降级为可选）。 */
+function readOptionalJson(file: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function stringOf(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -45,12 +57,8 @@ function jwtPayload(token: string): Record<string, unknown> {
   }
 }
 
-interface CapyInstallCredential extends LoginCredential {
-  readonly deviceId: string;
-}
-
 /** 只读 `%APPDATA%\\Capy` 的登录态；不启动 Capy，也不碰设备 token。 */
-export function readCapyInstall(dir = capyDir()): CapyInstallCredential {
+export async function readCapyInstall(dir = capyDir()): Promise<LoginCredential> {
   if (process.platform !== "win32") {
     throw new CapyError(
       "invalid_request",
@@ -59,8 +67,9 @@ export function readCapyInstall(dir = capyDir()): CapyInstallCredential {
   }
 
   const session = readJson(path.join(dir, "session-credential.json"), "session-credential.json");
-  const device = readJson(path.join(dir, "device-credentials.json"), "device-credentials.json");
   const localState = readJson(path.join(dir, "Local State"), "Local State");
+  // device-credentials.json 只用来提供 org 提示，缺失不影响登录（M-06）。
+  const device = readOptionalJson(path.join(dir, "device-credentials.json"));
 
   const sessionId = stringOf(session.sessionId);
   const userId = stringOf(session.userId);
@@ -69,17 +78,12 @@ export function readCapyInstall(dir = capyDir()): CapyInstallCredential {
     throw new CapyError("invalid_request", "Capy 的 session-credential.json 缺少字段");
   }
 
-  const orgs = device.orgs;
-  if (!orgs || typeof orgs !== "object" || Array.isArray(orgs)) {
-    throw new CapyError("invalid_request", "Capy 的 device-credentials.json 缺少 orgs");
-  }
-  const orgId = Object.keys(orgs as Record<string, unknown>)[0] ?? "";
-  const entry = orgId ? (orgs as Record<string, unknown>)[orgId] : null;
-  const deviceId = entry && typeof entry === "object" && !Array.isArray(entry)
-    ? stringOf((entry as Record<string, unknown>).deviceId)
-    : "";
-  if (!orgId || !deviceId) {
-    throw new CapyError("sign_in_required", "Capy 桌面端还没有已登录的组织/设备");
+  // 多组织时**不猜**（交给 pickOrg 用 /app/me 的偏好）；只有唯一组织才提示（M-06）。
+  let orgId = "";
+  const orgs = device?.orgs;
+  if (orgs && typeof orgs === "object" && !Array.isArray(orgs)) {
+    const keys = Object.keys(orgs as Record<string, unknown>);
+    if (keys.length === 1) orgId = keys[0] ?? "";
   }
 
   const osCrypt = localState.os_crypt;
@@ -96,7 +100,7 @@ export function readCapyInstall(dir = capyDir()): CapyInstallCredential {
 
   let clientJwt = "";
   try {
-    const key = coerceAesKey(dpapiUnprotect(raw.subarray(DPAPI_PREFIX.length)));
+    const key = coerceAesKey(await dpapiUnprotect(raw.subarray(DPAPI_PREFIX.length)));
     clientJwt = decryptChromiumAesGcm(ciphertext, key);
   } catch (error) {
     throw new CapyError(
@@ -107,16 +111,16 @@ export function readCapyInstall(dir = capyDir()): CapyInstallCredential {
   }
 
   const claims = jwtPayload(clientJwt);
+  // clientId 没有就留空，不再硬失败（M-07：clientId 采集后不用，
+  // 不值得为它拒绝一次本来有效的登录；LoginCredential.clientId 也是可选的）。
   const clientId = stringOf(claims.id);
-  if (!clientId) throw new CapyError("sign_in_required", "Capy 登录凭据缺少 Clerk client id");
 
   return {
     clientJwt,
     sessionId,
     userId,
     clientId,
-    orgId,
-    deviceId,
+    ...(orgId ? { orgId } : {}),
     source: "local",
   };
 }

@@ -96,7 +96,8 @@ export function describeModel(raw: RawModel, options: { toolsEnabled: boolean })
     reasoningModes,
     capabilities: {
       text: true,
-      // Capy 的 files/附件通道接受图片和 PDF；实际是否“看懂”由模型决定。
+      // 通道能力，未逐模型验证：Capy 的 files/附件通道接受图片和 PDF；
+      // 实际是否“看懂”由模型决定。
       image: true,
       pdf: true,
       attachment: true,
@@ -132,8 +133,9 @@ export function resolveModelId(
   if (byId) return byId.id;
 
   const short = target.split("/").pop() ?? target;
-  const byShort = models.find((model) => (model.id.split("/").pop() ?? model.id) === short);
-  if (byShort) return byShort.id;
+  const byShort = models.filter((model) => (model.id.split("/").pop() ?? model.id) === short);
+  if (byShort.length === 1) return byShort[0]?.id ?? "";
+  if (byShort.length > 1) throw ambiguousModel(wanted, byShort);
 
   const normalize = (value: string) => value.toLowerCase().replace(/[\s._-]+/gu, "");
   const norm = normalize(target);
@@ -143,6 +145,15 @@ export function resolveModelId(
   if (byName) return byName.id;
 
   throw new CapyError("model_not_found", `Capy 不认识模型 "${wanted}"`, { detail: wanted });
+}
+
+function ambiguousModel(wanted: string, candidates: readonly ModelDescriptor[]): CapyError {
+  const ids = candidates.map((model) => model.id);
+  return new CapyError(
+    "model_not_found",
+    `模型 "${wanted}" 有多个候选：${ids.join("、")}，请用完整模型 id`,
+    { detail: ids.join(",") },
+  );
 }
 
 export function reasoningModeOf(request: { reasoningEffort?: string }, model: ModelDescriptor | undefined): string {

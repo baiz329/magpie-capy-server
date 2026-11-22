@@ -147,3 +147,44 @@ test("requestJson：重试等待时调用方取消，立即停止重试（不再
   await expect(promise).rejects.toMatchObject({ name: "CapyError", kind: "upstream_unavailable" });
   expect(calls).toBe(1);
 });
+
+test("requestJson：429 重试等待不受单次超时约束（H-10）", async () => {
+  // 单次尝试超时 200ms，但 Retry-After 1s 的等待必须走完、重试成功；
+  // 旧行为用一把总 timer，200ms 到就把等待掐断。
+  let n = 0;
+  const fetchImpl = (async (): Promise<Response> => {
+    n += 1;
+    if (n === 1) return jsonResponse(429, { error: "slow down" }, { "retry-after": "1" });
+    return jsonResponse(200, { ok: true });
+  }) as unknown as typeof fetch;
+  const started = Date.now();
+  const result = await requestJson(fetchImpl, "https://example.test/x", {}, 200, {
+    maxRetries: MAX_429_RETRIES,
+  });
+  expect(result.response.status).toBe(200);
+  expect(n).toBe(2);
+  expect(Date.now() - started).toBeGreaterThanOrEqual(900);
+});
+
+test("requestJson：单次尝试挂住 → upstream_timeout 504（H-10/M-10）", async () => {
+  const fetchImpl = ((_url: string, init?: RequestInit): Promise<Response> => new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => {
+      reject(new DOMException("Aborted", "AbortError"));
+    }, { once: true });
+  })) as unknown as typeof fetch;
+  const started = Date.now();
+  const promise = requestJson(fetchImpl, "https://example.test/x", {}, 50);
+  await expect(promise).rejects.toMatchObject({ name: "CapyError", kind: "upstream_timeout", status: 504 });
+  expect(Date.now() - started).toBeLessThan(2000);
+});
+
+test("requestJson：响应体一直不来 → upstream_timeout（M-10，text() 在保护内）", async () => {
+  const fetchImpl = (async (): Promise<Response> => new Response(
+    new ReadableStream({}),
+    { status: 200, headers: { "content-type": "application/json" } },
+  )) as unknown as typeof fetch;
+  const started = Date.now();
+  const promise = requestJson(fetchImpl, "https://example.test/x", {}, 50);
+  await expect(promise).rejects.toMatchObject({ name: "CapyError", kind: "upstream_timeout", status: 504 });
+  expect(Date.now() - started).toBeLessThan(2000);
+});

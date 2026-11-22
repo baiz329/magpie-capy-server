@@ -9,6 +9,7 @@ import {
   reasoningModeOf,
   resolveModelId,
 } from "../../src/domain/model.ts";
+import { CapyError } from "../../src/domain/errors.ts";
 
 const models = [
   describeModel({ id: "openai/gpt-6.2-astra", reasoningModes: ["high"] }, { toolsEnabled: true }),
@@ -56,4 +57,25 @@ test("describeModel：能力/厂商", () => {
   expect(model.capabilities.pdf).toBe(true);
   expect(model.capabilities.tools).toBe(true);
   expect(model.reasoningModes).toEqual(["high"]);
+});
+
+test("resolveModelId：短名多候选 → model_not_found 并附候选（H-14(1)）", () => {
+  const models = [
+    { id: "a/gpt-x", name: "GPT X", vendor: "a", free: false, reasoningModes: [], capabilities: { text: true, image: true, pdf: true, attachment: true, tools: true } },
+    { id: "b/gpt-x", name: "GPT X", vendor: "b", free: false, reasoningModes: [], capabilities: { text: true, image: true, pdf: true, attachment: true, tools: true } },
+  ];
+  let caught: unknown = null;
+  try {
+    resolveModelId("gpt-x", models);
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(CapyError);
+  if (caught instanceof CapyError) {
+    expect(caught.kind).toBe("model_not_found");
+    expect(caught.message).toContain("a/gpt-x");
+    expect(caught.message).toContain("b/gpt-x");
+  }
+  // 唯一短名仍能解析。
+  expect(resolveModelId("gpt-x", models.slice(0, 1))).toBe("a/gpt-x");
 });

@@ -12,6 +12,7 @@ test("assistant 增量：累积 + finish", () => {
   const events = [
     ...normalizer.push(frame("assistant", { callId: "c1", text: "po" })),
     ...normalizer.push(frame("assistant", { callId: "c1", text: "pong" })),
+    ...normalizer.push(frame("done", {})),
     ...normalizer.finish(),
   ];
   expect(events).toEqual([
@@ -35,6 +36,7 @@ test("transcript 校正：只有 transcript 时补发 delta", () => {
   const events = [
     ...normalizer.push(frame("assistant", { callId: "c1", text: "po" })),
     ...normalizer.push(frame("transcript", { source: "assistant", text: "pong", callId: "c1" })),
+    ...normalizer.push(frame("done", {})),
     ...normalizer.finish(),
   ];
   expect(events).toEqual([

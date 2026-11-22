@@ -51,7 +51,7 @@ export interface JamFile {
 export interface CreateJamInput {
   readonly jamId: string;
   readonly requestId: string;
-  /** Capy 的幂等键；与 requestId 同值，但协议字段独立。 */
+  /** Capy 的幂等键；每次新建的独立 UUID，与 requestId 不同（ADR-011）。 */
   readonly clientKey: string;
   readonly message: string;
   readonly modelId: string;

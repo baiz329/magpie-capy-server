@@ -3,8 +3,7 @@ import { expect, test } from "bun:test";
 import { CapyAppClient } from "../../src/adapters/capy/app-client.ts";
 
 /**
- * 真实桌面端建对话请求（2026-11-21 桌面版 DevTools 抓包，app.har entry 0，
- * 已脱敏，见 spec/capture/desktop-create-jam-2026-11-21.json）。
+ * 真实桌面端建对话请求（2026-11-21 内部取证，未随仓库分发）。
  * 下面断言的是线上的字段集、字段顺序、显式 null 与 UUID clientKey。
  */
 
@@ -48,7 +47,7 @@ test("createJam 请求体与桌面端一致：16 字段、线上顺序、显式 
   expect(calls).toHaveLength(1);
   expect(calls[0]?.url).toBe("https://api.capy.ai/app/orgs/org_1/jams");
   const body = bodyOf(calls[0]!);
-  // 字段集与线上顺序（app.har entry 0 的 postData 原文顺序）。
+  // 字段集与线上顺序（内部取证的 postData 原文顺序）。
   expect(Object.keys(body)).toEqual([
     "jamId",
     "requestId",
@@ -178,4 +177,34 @@ test("createJam ads 模型带 ads-models 能力位", async () => {
   });
   const headers = headersOf(calls[0]!);
   expect(headers.get("x-capy-client-features")).toBe("message-edit,visual,ads-models");
+});
+
+test("createJam：缺 primaryMachine 或 kind 未知 → 显式报错，不默认 device（M-16）", async () => {
+  const noMachine = new CapyAppClient((async () =>
+    new Response(JSON.stringify({ id: "jam_1" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch);
+  await expect(noMachine.createJam("jwt", "org_1", {
+    jamId: "jam_1",
+    requestId: "r1",
+    clientKey: "r1",
+    message: "hi",
+    modelId: "m",
+    deviceId: "dev_1",
+  })).rejects.toMatchObject({ kind: "upstream_error" });
+
+  const badKind = new CapyAppClient((async () =>
+    new Response(JSON.stringify({ id: "jam_1", primaryMachine: { kind: "edge" } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch);
+  await expect(badKind.createJam("jwt", "org_1", {
+    jamId: "jam_1",
+    requestId: "r1",
+    clientKey: "r1",
+    message: "hi",
+    modelId: "m",
+    deviceId: "dev_1",
+  })).rejects.toMatchObject({ kind: "upstream_error" });
 });

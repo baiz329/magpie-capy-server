@@ -27,6 +27,8 @@ export interface ChatRunOptions {
   readonly files?: readonly JamFile[];
   readonly reasoningMode?: string;
   readonly promptVariant?: "minimal";
+  /** 已由 resolveModelId 规范化过的 modelId；缺省回退 request.model。 */
+  readonly modelId?: string;
   readonly onThread?: (thread: JamCreated) => void;
   readonly onVariantFallback?: () => void;
 }
@@ -37,20 +39,13 @@ interface JwtCacheEntry {
 }
 
 const JWT_TTL_MS = 50_000;
-
-// Burst smoothing: Capy sometimes sends the full text in one frame; a single
-// huge delta makes downstream TPS explode (all tokens in ~0s) and magpie show
-// no speed. Split a large delta into small pieces with a short delay so the
-// stream looks gradual. Only applies to bursts; normal incremental deltas
-// pass through immediately. First piece goes out with no delay (TTFT unchanged).
-const PACE_THRESHOLD = 200; // code points; pace only deltas larger than this
-const PACE_CHUNK = 40; // code points per piece
-const PACE_DELAY_MS = 50; // ms between pieces
-const PACE_MAX_MS = 2000; // max total pacing time per delta
+/** JWT 缓存上限（M-05）：按插入顺序淘汰最旧。 */
+const MAX_JWT_ENTRIES = 128;
 
 export class ChatUseCase {
   private readonly options: ChatUseCaseOptions;
   private readonly jwtCache = new Map<string, JwtCacheEntry>();
+  private readonly jwtInflight = new Map<string, Promise<string>>();
 
   constructor(options: ChatUseCaseOptions) {
     this.options = options;
@@ -65,8 +60,10 @@ export class ChatUseCase {
     const toolInstruction = this.options.toolsEnabled
       ? this.options.tools.instruction(request.tools ?? [], request.toolChoice)
       : "";
-    const prompt = buildPrompt(request.messages, { toolInstruction });
+    const prompt = buildPrompt(request.messages, { toolInstruction, nonce: this.options.ids.uuid() });
     const jwt = await this.sessionJwt(session, run.signal);
+    // createJam 与 isAdsModel 都必须用规范化后的 modelId（H-14(1)）。
+    const modelId = run.modelId ?? request.model;
 
     const create = async (promptVariant?: "minimal") => {
       const requestId = this.options.ids.ulid();
@@ -75,12 +72,12 @@ export class ChatUseCase {
         requestId,
         clientKey: requestId,
         message: prompt,
-        modelId: request.model,
+        modelId,
         deviceId: device.id,
         ...(run.reasoningMode ? { reasoningMode: run.reasoningMode } : {}),
         ...(run.files && run.files.length > 0 ? { files: run.files } : {}),
         ...(promptVariant ? { promptVariant } : {}),
-        ...(isAdsModel(request.model) ? { ads: true } : {}),
+        ...(isAdsModel(modelId) ? { ads: true } : {}),
       }, run.signal);
     };
 
@@ -88,7 +85,10 @@ export class ChatUseCase {
     try {
       thread = await create(run.promptVariant);
     } catch (error) {
-      // minimal 是账号级开关；403 时改用 default 重试一次。
+      // minimal 是账号级开关：minimal 尝试遇到任何 403 就不带 variant 重试一次。
+      // 不能按 detail 文本过滤——Capy 实际返回的 403 是 {"_tag":"capy/Forbidden"}，
+      // detail 里没有 variant 这个词，过滤会让重试永远不触发（v0.3.1 回归）。
+      // 降级只记在当前账号名下（onVariantFallback → 按账号的门控），不拖累其它账号。
       if (run.promptVariant === "minimal" && error instanceof CapyError && error.status === 403) {
         run.onVariantFallback?.();
         thread = await create();
@@ -110,15 +110,14 @@ export class ChatUseCase {
     if (blocked) throw blocked;
 
     const normalizer = new PublicSseNormalizer();
+    // 只有正常跑完（finish 产出 done）才算完成；其它退出路径（失败/取消/
+    // 断流）都要 interruptJam，避免上游线程继续跑（M-11）。
+    let completedNormally = false;
     try {
       for await (const frame of this.options.publicApi.streamThread(session.accessToken, thread.id, run.signal)) {
-        for (const event of normalizer.push(frame)) {
-          if (event.type === "delta") {
-            yield* this.paceDelta(event.text, run.signal);
-          } else {
-            yield event;
-          }
-        }
+        for (const event of normalizer.push(frame)) yield event;
+        // 见终态即断开上游读取：不再等流自然结束。
+        if (normalizer.completed) break;
       }
       if (!normalizer.text && !normalizer.hasError) {
         const failure = await this.jamFailure(jwt, session.orgId, thread.id, run.signal);
@@ -127,7 +126,9 @@ export class ChatUseCase {
           return;
         }
       }
-      for (const event of normalizer.finish()) yield event;
+      const finishEvents = normalizer.finish();
+      for (const event of finishEvents) yield event;
+      if (finishEvents.some((event) => event.type === "done")) completedNormally = true;
     } catch (error) {
       if (error instanceof CapyError) {
         yield { type: "error", error };
@@ -138,6 +139,14 @@ export class ChatUseCase {
         type: "error",
         error: new CapyError("upstream_unavailable", errorMessage(error), { cause: error }),
       };
+    } finally {
+      if (!completedNormally) {
+        try {
+          await this.options.app.interruptJam(jwt, session.orgId, thread.id, run.signal);
+        } catch {
+          // best-effort：中断失败不掩盖原有结果
+        }
+      }
     }
   }
 
@@ -170,37 +179,36 @@ export class ChatUseCase {
     }
   }
 
-  private async *paceDelta(text: string, signal?: AbortSignal): AsyncIterable<ChatEvent> {
-    const points = Array.from(text);
-    if (points.length <= PACE_THRESHOLD) {
-      yield { type: "delta", text };
-      return;
-    }
-    const pieces: string[] = [];
-    for (let i = 0; i < points.length; i += PACE_CHUNK) {
-      pieces.push(points.slice(i, i + PACE_CHUNK).join(""));
-    }
-    let delay = PACE_DELAY_MS;
-    const total = (pieces.length - 1) * delay;
-    if (total > PACE_MAX_MS) {
-      delay = Math.floor(PACE_MAX_MS / (pieces.length - 1));
-    }
-    for (let i = 0; i < pieces.length; i++) {
-      if (i > 0 && delay > 0) {
-        await this.options.clock.sleep(delay, signal);
-      }
-      yield { type: "delta", text: pieces[i]! };
-    }
-  }
-
+  /**
+   * JWT 缓存：命中未过期直接返回；过期立即删除；并发请求共享同一次签发（H-13(3)）。
+   * 缓存有上限：满 128 条时按插入顺序淘汰最旧（M-05）。
+   */
   private async sessionJwt(session: AccountSession, signal?: AbortSignal): Promise<string> {
     const key = `${accountKey(session)}:${session.clerk.sessionId}`;
     const hit = this.jwtCache.get(key);
     const now = this.options.clock.now();
-    if (hit && hit.expiresAt > now) return hit.jwt;
-    const jwt = await this.options.app.sessionJwt(session.clerk, signal);
-    this.jwtCache.set(key, { jwt, expiresAt: now + JWT_TTL_MS });
-    return jwt;
+    if (hit) {
+      if (hit.expiresAt > now) return hit.jwt;
+      this.jwtCache.delete(key);
+    }
+    const inflight = this.jwtInflight.get(key);
+    if (inflight) return await inflight;
+    const task = (async () => {
+      const jwt = await this.options.app.sessionJwt(session.clerk, signal);
+      while (this.jwtCache.size >= MAX_JWT_ENTRIES) {
+        const oldest = this.jwtCache.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        this.jwtCache.delete(oldest);
+      }
+      this.jwtCache.set(key, { jwt, expiresAt: this.options.clock.now() + JWT_TTL_MS });
+      return jwt;
+    })();
+    this.jwtInflight.set(key, task);
+    try {
+      return await task;
+    } finally {
+      if (this.jwtInflight.get(key) === task) this.jwtInflight.delete(key);
+    }
   }
 }
 

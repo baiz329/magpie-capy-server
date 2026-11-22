@@ -8,7 +8,7 @@ test("buildUsage：无余额 → used=100；不显示本期消费", () => {
     { remainingDollars: null, unlimited: false },
   );
   expect(usage.windows[0]).toMatchObject({ name: "余额", used: 100 });
-  expect(usage.windows[0]?.display).toContain("无可用余额");
+  expect(usage.windows[0]?.display).toBe("余额未知");
   expect(usage.windows.every((window) => window.name !== "本期消费")).toBe(true);
   expect(usage.windows.some((window) => window.name === "Token")).toBe(true);
 });
@@ -40,4 +40,9 @@ test("withDeviceWindow：已连接/未连接", () => {
 test("money", () => {
   expect(money(12.25)).toBe("$12.25");
   expect(money(120)).toBe("$120");
+  // >=100 有小数不丢小数；负数符号在货币符号前面（M-03）。
+  expect(money(120.5)).toBe("$120.50");
+  expect(money(123.45)).toBe("$123.45");
+  expect(money(-5.25)).toBe("-$5.25");
+  expect(money(-120)).toBe("-$120");
 });

@@ -22,6 +22,9 @@ test("single-flight：并发 ensure 只调用一次", async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
       return { id: "device_1", name: "magpie-headless", connected: true };
     },
+    peek() {
+      return { id: "", name: "magpie-headless", connected: false };
+    },
     close() {},
   };
   const useCase = new DeviceUseCase(runtime);
@@ -39,6 +42,9 @@ test("失败后允许重试", async () => {
       if (calls === 1) throw new Error("boom");
       return { id: "device_1", name: "magpie-headless", connected: true };
     },
+    peek() {
+      return { id: "", name: "magpie-headless", connected: false };
+    },
     close() {},
   };
   const useCase = new DeviceUseCase(runtime);
@@ -46,4 +52,21 @@ test("失败后允许重试", async () => {
   const device = await useCase.ensure(session);
   expect(device.id).toBe("device_1");
   expect(calls).toBe(2);
+});
+
+test("peek：只读快照，不触发 ensure", () => {
+  let calls = 0;
+  const runtime: DeviceRuntimePort = {
+    async ensure() {
+      calls += 1;
+      return { id: "device_1", name: "magpie-headless", connected: true };
+    },
+    peek() {
+      return { id: "device_1", name: "magpie-headless", connected: true };
+    },
+    close() {},
+  };
+  const useCase = new DeviceUseCase(runtime);
+  expect(useCase.peek(session)).toEqual({ id: "device_1", name: "magpie-headless", connected: true });
+  expect(calls).toBe(0);
 });

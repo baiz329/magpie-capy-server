@@ -10,12 +10,19 @@ export const CAPY_APP_ORIGIN = "capy://app";
 import { desktopSecChUa, desktopUserAgent, FALLBACK_DESKTOP_VERSION } from "./client-version.ts";
 
 /**
- * App API 请求头：与真实桌面端一致（2026-11-21 抓包，
- * spec/capture/desktop-create-jam-2026-11-21.json）。
+ * App API 请求头：与真实桌面端一致（2026-11-21 内部取证，未随仓库分发）。
  * 桌面端不发 referer；origin 是 capy://app；sec-fetch-site 是 cross-site。
  * 有意不发的：accept-encoding（fetch 运行时自动协商/解压）、
  * b3/traceparent（桌面端观测 SDK 的逐请求追踪 id，不是固定值）。
  */
+/** x-capy-client-features 基线：所有 App 请求走同一处拼装（P3-12）。 */
+export const CAPY_CLIENT_FEATURES_BASE = "message-edit,visual";
+
+/** 免费广告模型在基线后追加 ads-models 能力位。 */
+export function clientFeatures(ads: boolean): string {
+  return ads ? `${CAPY_CLIENT_FEATURES_BASE},ads-models` : CAPY_CLIENT_FEATURES_BASE;
+}
+
 function appHeaders(jwt: string, extra: Record<string, string> = {}, userAgent: string = desktopUserAgent(FALLBACK_DESKTOP_VERSION)): Record<string, string> {
   return {
     authorization: `Bearer ${jwt}`,
@@ -32,7 +39,7 @@ function appHeaders(jwt: string, extra: Record<string, string> = {}, userAgent: 
     "sec-fetch-site": "cross-site",
     "user-agent": userAgent,
     "x-capy-client-surface": "desktop",
-    "x-capy-client-features": "message-edit,visual",
+    "x-capy-client-features": CAPY_CLIENT_FEATURES_BASE,
     "x-capy-client-timezone": timezone(),
     ...extra,
   };

@@ -665,6 +665,7 @@ class CapyError extends Error {
   status;
   retryable;
   detail;
+  retryAfterMs;
   constructor(kind, message, options = {}) {
     super(message, { cause: options.cause });
     this.name = "CapyError";
@@ -672,6 +673,7 @@ class CapyError extends Error {
     this.status = options.status ?? STATUS[kind];
     this.retryable = options.retryable ?? RETRYABLE.has(kind);
     this.detail = options.detail;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 function isCapyError(value) {
@@ -680,8 +682,9 @@ function isCapyError(value) {
 function isAuthError(value) {
   return isCapyError(value) && value.kind === "sign_in_required";
 }
-function mapUpstream(status, body, fallback = "") {
+function mapUpstream(status, body, fallback = "", retryAfterMs) {
   const tag = tagOf(body);
+  const code = codeOf(body);
   const message = messageOf(body) || fallback || `Capy upstream error (HTTP ${status})`;
   if (status === 401 || tag === "capy/Unauthorized") {
     return new CapyError("sign_in_required", "Capy \u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55", { detail: message });
@@ -690,10 +693,16 @@ function mapUpstream(status, body, fallback = "") {
     return new CapyError("insufficient_quota", message || "Capy \u989D\u5EA6\u4E0D\u8DB3", { detail: tag });
   }
   if (status === 403 || tag === "capy/Forbidden") {
+    if (/region_unsupported|RegionUnsupported/iu.test(`${tag} ${code} ${message}`)) {
+      return new CapyError("region_unsupported", message || "Capy \u5728\u5F53\u524D\u5730\u533A\u4E0D\u53EF\u7528", { detail: code || tag });
+    }
     return new CapyError("upstream_error", message || "Capy \u62D2\u7EDD\u4E86\u8FD9\u4E2A\u8BF7\u6C42", { status: 403, detail: tag });
   }
   if (status === 429 || tag === "capy/RateLimited") {
-    return new CapyError("rate_limited", message || "Capy \u9650\u6D41", { detail: tag });
+    return new CapyError("rate_limited", message || "Capy \u9650\u6D41", {
+      detail: tag,
+      ...typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs >= 0 ? { retryAfterMs } : {}
+    });
   }
   if (status === 404 || tag.endsWith("NotFound")) {
     const kind = /model/iu.test(tag) ? "model_not_found" : "not_found";
@@ -718,6 +727,25 @@ function tagOf(body) {
     return "";
   const tag = body._tag;
   return typeof tag === "string" ? tag : "";
+}
+function codeOf(body) {
+  if (!body || typeof body !== "object")
+    return "";
+  const record = body;
+  if (typeof record.code === "string")
+    return record.code;
+  const nested = record.error;
+  if (nested && typeof nested === "object" && typeof nested.code === "string")
+    return nested.code;
+  return "";
+}
+function retryAfterSeconds(error) {
+  if (!isCapyError(error))
+    return null;
+  const ms = error.retryAfterMs;
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0)
+    return null;
+  return Math.ceil(ms / 1000);
 }
 function messageOf(body) {
   if (!body || typeof body !== "object")
@@ -793,42 +821,92 @@ async function defaultSleep(ms, signal) {
     signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
+function attemptSignal(outerSignal, timeoutMs) {
+  const controller = new AbortController;
+  let timer;
+  if (timeoutMs !== undefined) {
+    timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+  }
+  const onOuterAbort = () => controller.abort(outerSignal?.reason);
+  if (outerSignal) {
+    if (outerSignal.aborted)
+      controller.abort(outerSignal.reason);
+    else
+      outerSignal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      if (timer !== undefined)
+        clearTimeout(timer);
+      outerSignal?.removeEventListener("abort", onOuterAbort);
+    }
+  };
+}
 async function fetchWith429Retry(fetchImpl, url, init, options = {}) {
   const maxRetries = options.maxRetries ?? MAX_429_RETRIES;
   const sleep = options.sleep ?? defaultSleep;
+  const outerSignal = init.signal ?? undefined;
   let attempt = 0;
   for (;; ) {
-    const response = await fetchImpl(url, init);
+    const { signal, cleanup } = attemptSignal(outerSignal, options.attemptTimeoutMs);
+    let response;
+    try {
+      response = await fetchImpl(url, { ...init, signal });
+    } finally {
+      cleanup();
+    }
     if (response.status !== 429 || attempt >= maxRetries)
       return response;
     const delay = retryDelayMs(response.headers, attempt + 1);
     attempt += 1;
     await response.body?.cancel().catch(() => {});
-    await sleep(delay, init.signal ?? undefined);
+    await sleep(delay, outerSignal);
+  }
+}
+function isAbortError(error) {
+  return error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError");
+}
+async function readTextWithTimeout(response, timeoutMs, outerSignal) {
+  let timer;
+  let rejectAbort;
+  const abortPromise = new Promise((_resolve, reject) => {
+    rejectAbort = reject;
+    timer = setTimeout(() => reject(new DOMException("Aborted", "AbortError")), Math.max(1, timeoutMs));
+  });
+  const onOuterAbort = () => rejectAbort?.(new DOMException("Aborted", "AbortError"));
+  if (outerSignal) {
+    if (outerSignal.aborted)
+      rejectAbort?.(new DOMException("Aborted", "AbortError"));
+    else
+      outerSignal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  try {
+    return await Promise.race([response.text(), abortPromise]);
+  } finally {
+    if (timer !== undefined)
+      clearTimeout(timer);
+    outerSignal?.removeEventListener("abort", onOuterAbort);
   }
 }
 async function requestJson(fetchImpl, url, init = {}, timeoutMs = 30000, retry) {
-  const controller = new AbortController;
-  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
-  const signal = init.signal;
-  const onAbort = () => controller.abort();
-  if (signal) {
-    if (signal.aborted)
-      controller.abort();
-    else
-      signal.addEventListener("abort", onAbort, { once: true });
-  }
+  const outerSignal = init.signal ?? undefined;
   try {
     let response;
-    try {
-      response = retry ? await fetchWith429Retry(fetchImpl, url, { ...init, signal: controller.signal }, retry) : await fetchImpl(url, { ...init, signal: controller.signal });
-    } catch (error) {
-      if (controller.signal.aborted && !signal?.aborted) {
-        throw new CapyError("upstream_timeout", "\u8FDE\u63A5 Capy \u8D85\u65F6\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC/\u4EE3\u7406\u540E\u91CD\u8BD5", { cause: error });
+    if (retry) {
+      response = await fetchWith429Retry(fetchImpl, url, init, {
+        ...retry,
+        attemptTimeoutMs: timeoutMs
+      });
+    } else {
+      const { signal, cleanup } = attemptSignal(outerSignal, timeoutMs);
+      try {
+        response = await fetchImpl(url, { ...init, signal });
+      } finally {
+        cleanup();
       }
-      throw new CapyError("upstream_unavailable", `\u8FDE\u63A5 Capy \u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
-    const text = await response.text();
+    const text = await readTextWithTimeout(response, timeoutMs, outerSignal);
     let body = null;
     if (text) {
       try {
@@ -838,9 +916,14 @@ async function requestJson(fetchImpl, url, init = {}, timeoutMs = 30000, retry) 
       }
     }
     return { response, body, text };
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
+  } catch (error) {
+    if (isAbortError(error)) {
+      if (outerSignal?.aborted) {
+        throw new CapyError("upstream_unavailable", `\u8FDE\u63A5 Capy \u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      }
+      throw new CapyError("upstream_timeout", "\u8FDE\u63A5 Capy \u8D85\u65F6\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC/\u4EE3\u7406\u540E\u91CD\u8BD5", { cause: error });
+    }
+    throw new CapyError("upstream_unavailable", `\u8FDE\u63A5 Capy \u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`, { cause: error });
   }
 }
 
@@ -850,7 +933,8 @@ var FALLBACK_DESKTOP_VERSION = "0.9.2";
 var DESKTOP_CHROME_VERSION = "156.0.8078.80";
 var DESKTOP_ELECTRON_VERSION = "45.2.3";
 var DEFAULT_VERSION_TTL_MS = 24 * 60 * 60 * 1000;
-var DEFAULT_VERSION_TIMEOUT_MS = 5000;
+var DEFAULT_VERSION_TIMEOUT_MS = 1500;
+var VERSION_FAILURE_TTL_MS = 5 * 60 * 1000;
 var VERSION_RE = /Version\s+(\d+\.\d+\.\d+)/;
 function parseDesktopVersion(html) {
   const match = VERSION_RE.exec(html);
@@ -872,6 +956,20 @@ function createDesktopVersionProbe(options = {}) {
   const now = options.now ?? Date.now;
   let cached = null;
   let inFlight = null;
+  let negativeUntil = 0;
+  let warned = false;
+  function fallbackVersion() {
+    return cached?.version ?? FALLBACK_DESKTOP_VERSION;
+  }
+  function noteFailure(reason) {
+    negativeUntil = now() + VERSION_FAILURE_TTL_MS;
+    if (warned)
+      return;
+    warned = true;
+    try {
+      options.onWarn?.(`Capy \u684C\u9762\u7248\u672C\u63A2\u6D4B\u5931\u8D25\uFF0C\u56DE\u9000 ${fallbackVersion()}\uFF1A${reason}`);
+    } catch {}
+  }
   async function probe() {
     const controller = new AbortController;
     let timeoutId;
@@ -886,16 +984,22 @@ function createDesktopVersionProbe(options = {}) {
         fetchImpl(downloadUrl, { signal: controller.signal }),
         timeout
       ]);
-      if (!response.ok)
-        return cached?.version ?? FALLBACK_DESKTOP_VERSION;
+      if (!response.ok) {
+        noteFailure(`HTTP ${response.status}`);
+        return fallbackVersion();
+      }
       const html = await response.text();
       const version = parseDesktopVersion(html);
-      if (!version)
-        return cached?.version ?? FALLBACK_DESKTOP_VERSION;
+      if (!version) {
+        noteFailure("\u4E0B\u8F7D\u9875\u6CA1\u6709\u7248\u672C\u53F7");
+        return fallbackVersion();
+      }
       cached = { version, atMs: now() };
+      negativeUntil = 0;
       return version;
-    } catch {
-      return cached?.version ?? FALLBACK_DESKTOP_VERSION;
+    } catch (error) {
+      noteFailure(error instanceof Error ? error.message : String(error));
+      return fallbackVersion();
     } finally {
       clearTimeout(timeoutId);
     }
@@ -904,6 +1008,8 @@ function createDesktopVersionProbe(options = {}) {
     async currentVersion() {
       if (cached && now() - cached.atMs < ttlMs)
         return cached.version;
+      if (now() < negativeUntil)
+        return fallbackVersion();
       if (inFlight)
         return inFlight;
       inFlight = probe();
@@ -924,6 +1030,10 @@ var CAPY_PUBLIC = "https://api.capy.ai/api/v1";
 var DEVICE_TUNNEL = "wss://device-tunnel-production.cloud.capy.ai/tunnel";
 var CONTRACT_VERSION = 2;
 var CAPY_APP_ORIGIN = "capy://app";
+var CAPY_CLIENT_FEATURES_BASE = "message-edit,visual";
+function clientFeatures(ads) {
+  return ads ? `${CAPY_CLIENT_FEATURES_BASE},ads-models` : CAPY_CLIENT_FEATURES_BASE;
+}
 function appHeaders(jwt, extra = {}, userAgent = desktopUserAgent(FALLBACK_DESKTOP_VERSION)) {
   return {
     authorization: `Bearer ${jwt}`,
@@ -940,7 +1050,7 @@ function appHeaders(jwt, extra = {}, userAgent = desktopUserAgent(FALLBACK_DESKT
     "sec-fetch-site": "cross-site",
     "user-agent": userAgent,
     "x-capy-client-surface": "desktop",
-    "x-capy-client-features": "message-edit,visual",
+    "x-capy-client-features": CAPY_CLIENT_FEATURES_BASE,
     "x-capy-client-timezone": timezone(),
     ...extra
   };
@@ -984,7 +1094,18 @@ class ClerkClient {
       ...signal ? { signal } : {}
     }, 20000);
     if (!response.ok) {
-      throw new CapyError("sign_in_required", `Capy \u4F1A\u8BDD\u6362\u7968\u5931\u8D25\uFF08HTTP ${response.status}\uFF09\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55`, { detail: text.slice(0, 200) });
+      const detail = text.slice(0, 200);
+      if (response.status === 429) {
+        const retryAfter = parseRetryAfterMs(response.headers.get("retry-after"));
+        throw new CapyError("rate_limited", "Clerk \u9650\u6D41\uFF08HTTP 429\uFF09\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5", {
+          detail,
+          ...retryAfter !== null ? { retryAfterMs: retryAfter } : {}
+        });
+      }
+      if (response.status >= 500) {
+        throw new CapyError("upstream_unavailable", `Clerk \u670D\u52A1\u5F02\u5E38\uFF08HTTP ${response.status}\uFF09\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5`, { detail });
+      }
+      throw new CapyError("sign_in_required", `Capy \u4F1A\u8BDD\u6362\u7968\u5931\u8D25\uFF08HTTP ${response.status}\uFF09\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55`, { detail });
     }
     const record = body;
     const jwt = typeof record?.jwt === "string" ? record.jwt : typeof record?.response?.jwt === "string" ? record.response.jwt : "";
@@ -1196,17 +1317,23 @@ class CapyAppClient {
         memberIds: null
       }),
       ...signal ? { signal } : {}
-    }, input.ads ? { "x-capy-client-features": "message-edit,visual,ads-models" } : {}, { maxRetries: MAX_429_RETRIES });
+    }, input.ads ? { "x-capy-client-features": clientFeatures(true) } : {}, { maxRetries: MAX_429_RETRIES });
     const record = body;
     const id = String(record.id ?? "").trim();
     if (!id)
       throw new CapyError("upstream_error", "Capy \u521B\u5EFA\u7EBF\u7A0B\u6CA1\u6709\u8FD4\u56DE id");
     const machine = record.primaryMachine;
-    const kind = machine && typeof machine === "object" && !Array.isArray(machine) ? String(machine.kind ?? "") : "";
+    if (!machine || typeof machine !== "object" || Array.isArray(machine)) {
+      throw new CapyError("upstream_error", "Capy \u521B\u5EFA\u7EBF\u7A0B\u6CA1\u6709\u8FD4\u56DE primaryMachine");
+    }
+    const kind = String(machine.kind ?? "");
+    if (kind !== "device" && kind !== "cloud") {
+      throw new CapyError("upstream_error", `Capy \u521B\u5EFA\u7EBF\u7A0B\u8FD4\u56DE\u4E86\u672A\u77E5\u7684 primaryMachine kind\uFF1A${kind || "\uFF08\u7A7A\uFF09"}`);
+    }
     return {
       id,
       primaryMachine: {
-        kind: kind === "cloud" ? "cloud" : "device",
+        kind,
         ...machine && typeof machine === "object" && !Array.isArray(machine) && typeof machine.name === "string" ? { name: String(machine.name) } : {}
       },
       ...record.ask === null || record.ask && typeof record.ask === "object" ? { ask: record.ask } : {},
@@ -1270,7 +1397,7 @@ class CapyAppClient {
 }
 
 // src/adapters/capy/browser-login.ts
-import { spawn } from "child_process";
+import { spawn as spawn2 } from "child_process";
 import { createServer } from "net";
 import fs2 from "fs";
 import os3 from "os";
@@ -1282,37 +1409,91 @@ import os2 from "os";
 import path from "path";
 
 // src/adapters/platform/dpapi.ts
-import { execFileSync } from "child_process";
+import { spawn } from "child_process";
 import crypto from "crypto";
 var V10_PREFIX = "v10";
 var NONCE_BYTES = 12;
 var TAG_BYTES = 16;
 var AES_KEY_BYTES = 32;
 var DPAPI_TIMEOUT_MS = 15000;
-function powershell(script) {
-  return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], { encoding: "utf8", timeout: DPAPI_TIMEOUT_MS, windowsHide: true, maxBuffer: 1024 * 1024 }).trim();
+function powershellExecutable(env = process.env) {
+  const systemRoot = String(env.SystemRoot ?? "").trim() || "C:\\Windows";
+  return `${systemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
 }
-function dpapiUnprotect(blob) {
+function powershell(script, stdin) {
+  const encodedScript = Buffer.from(script, "utf16le").toString("base64");
+  return new Promise((resolve, reject) => {
+    const child = spawn(powershellExecutable(), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "RemoteSigned", "-EncodedCommand", encodedScript], { windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled)
+        return;
+      settled = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      reject(new Error("DPAPI timed out"));
+    }, DPAPI_TIMEOUT_MS);
+    timer.unref?.();
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => {
+      if (settled)
+        return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      if (settled)
+        return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0)
+        resolve(stdout.trim());
+      else
+        reject(new Error(`powershell exited ${String(code)}: ${stderr.slice(0, 200)}`));
+    });
+    try {
+      child.stdin?.end(stdin);
+    } catch (error) {
+      if (settled)
+        return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+async function dpapiUnprotect(blob) {
   if (process.platform !== "win32")
     throw new Error("DPAPI \u53EA\u5728 Windows \u53EF\u7528");
   const encoded = Buffer.from(blob).toString("base64");
   const script = `$ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Security
-$b=[Convert]::FromBase64String('${encoded}')
+$raw=[Console]::In.ReadToEnd().Trim()
+$b=[Convert]::FromBase64String($raw)
 $p=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
 [Convert]::ToBase64String($p)`;
-  return Buffer.from(powershell(script), "base64");
+  return Buffer.from(await powershell(script, encoded), "base64");
 }
-function dpapiProtect(text) {
+async function dpapiProtect(text) {
   if (process.platform !== "win32")
     throw new Error("DPAPI \u53EA\u5728 Windows \u53EF\u7528");
   const encoded = Buffer.from(text, "utf8").toString("base64");
   const script = `$ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Security
-$b=[Convert]::FromBase64String('${encoded}')
+$raw=[Console]::In.ReadToEnd().Trim()
+$b=[Convert]::FromBase64String($raw)
 $p=[System.Security.Cryptography.ProtectedData]::Protect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
 [Convert]::ToBase64String($p)`;
-  return powershell(script);
+  return powershell(script, encoded);
 }
 function decryptChromiumAesGcm(ciphertextBase64, key) {
   const raw = Buffer.from(ciphertextBase64, "base64");
@@ -1367,6 +1548,14 @@ function readJson(file, label) {
     throw new CapyError("invalid_request", `Capy \u7684 ${label} \u4E0D\u662F\u6709\u6548 JSON`);
   }
 }
+function readOptionalJson(file) {
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
 function stringOf(value) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -1383,28 +1572,25 @@ function jwtPayload(token) {
     throw new CapyError("sign_in_required", "Capy \u767B\u5F55\u51ED\u636E\u7684 JWT payload \u65E0\u6CD5\u89E3\u6790");
   }
 }
-function readCapyInstall(dir = capyDir()) {
+async function readCapyInstall(dir = capyDir()) {
   if (process.platform !== "win32") {
     throw new CapyError("invalid_request", "\u672C\u673A\u5BFC\u5165\u53EA\u652F\u6301 Windows\uFF08Capy \u672C\u5730\u51ED\u636E\u7528 DPAPI \u52A0\u5BC6\uFF09\uFF1B\u8BF7\u7528\u6D4F\u89C8\u5668\u767B\u5F55");
   }
   const session = readJson(path.join(dir, "session-credential.json"), "session-credential.json");
-  const device = readJson(path.join(dir, "device-credentials.json"), "device-credentials.json");
   const localState = readJson(path.join(dir, "Local State"), "Local State");
+  const device = readOptionalJson(path.join(dir, "device-credentials.json"));
   const sessionId = stringOf(session.sessionId);
   const userId = stringOf(session.userId);
   const ciphertext = stringOf(session.ciphertext);
   if (!sessionId || !userId || !ciphertext) {
     throw new CapyError("invalid_request", "Capy \u7684 session-credential.json \u7F3A\u5C11\u5B57\u6BB5");
   }
-  const orgs = device.orgs;
-  if (!orgs || typeof orgs !== "object" || Array.isArray(orgs)) {
-    throw new CapyError("invalid_request", "Capy \u7684 device-credentials.json \u7F3A\u5C11 orgs");
-  }
-  const orgId = Object.keys(orgs)[0] ?? "";
-  const entry = orgId ? orgs[orgId] : null;
-  const deviceId = entry && typeof entry === "object" && !Array.isArray(entry) ? stringOf(entry.deviceId) : "";
-  if (!orgId || !deviceId) {
-    throw new CapyError("sign_in_required", "Capy \u684C\u9762\u7AEF\u8FD8\u6CA1\u6709\u5DF2\u767B\u5F55\u7684\u7EC4\u7EC7/\u8BBE\u5907");
+  let orgId = "";
+  const orgs = device?.orgs;
+  if (orgs && typeof orgs === "object" && !Array.isArray(orgs)) {
+    const keys = Object.keys(orgs);
+    if (keys.length === 1)
+      orgId = keys[0] ?? "";
   }
   const osCrypt = localState.os_crypt;
   const encryptedKey = osCrypt && typeof osCrypt === "object" && !Array.isArray(osCrypt) ? stringOf(osCrypt.encrypted_key) : "";
@@ -1417,22 +1603,19 @@ function readCapyInstall(dir = capyDir()) {
   }
   let clientJwt = "";
   try {
-    const key = coerceAesKey(dpapiUnprotect(raw.subarray(DPAPI_PREFIX.length)));
+    const key = coerceAesKey(await dpapiUnprotect(raw.subarray(DPAPI_PREFIX.length)));
     clientJwt = decryptChromiumAesGcm(ciphertext, key);
   } catch (error) {
     throw new CapyError("sign_in_required", "\u65E0\u6CD5\u89E3\u5BC6 Capy \u672C\u5730\u767B\u5F55\u6001\uFF0C\u8BF7\u786E\u8BA4\u5F53\u524D Windows \u7528\u6237\u5C31\u662F\u767B\u5F55 Capy \u7684\u7528\u6237\uFF0C\u6216\u91CD\u65B0\u767B\u5F55", { cause: error });
   }
   const claims = jwtPayload(clientJwt);
   const clientId = stringOf(claims.id);
-  if (!clientId)
-    throw new CapyError("sign_in_required", "Capy \u767B\u5F55\u51ED\u636E\u7F3A\u5C11 Clerk client id");
   return {
     clientJwt,
     sessionId,
     userId,
     clientId,
-    orgId,
-    deviceId,
+    ...orgId ? { orgId } : {},
     source: "local"
   };
 }
@@ -1554,6 +1737,20 @@ async function waitPort(port, signal, timeoutMs) {
   }
   return false;
 }
+function isCapyPageUrl(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text)
+    return false;
+  try {
+    const url = new URL(text);
+    if (url.protocol !== "https:")
+      return false;
+    const host = url.hostname.toLowerCase();
+    return host === "capy.ai" || host === "clerk.capy.ai" || host.endsWith(".capy.ai");
+  } catch {
+    return false;
+  }
+}
 async function connectPage(port, signal, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1564,7 +1761,7 @@ async function connectPage(port, signal, timeoutMs) {
         if (!item || typeof item !== "object")
           return false;
         const record = item;
-        return record.type === "page" && typeof record.webSocketDebuggerUrl === "string";
+        return record.type === "page" && typeof record.webSocketDebuggerUrl === "string" && isCapyPageUrl(record.url);
       });
       if (page && typeof page.webSocketDebuggerUrl === "string") {
         const ws = new WebSocket(page.webSocketDebuggerUrl);
@@ -1623,6 +1820,12 @@ var SELECTED_ORG = `(() => {
       || "";
   } catch { return ""; }
 })()`;
+function isCapyCookieDomain(raw) {
+  const domain = String(raw ?? "").trim().toLowerCase().replace(/^\./u, "");
+  if (!domain)
+    return false;
+  return domain === "capy.ai" || domain === "clerk.capy.ai" || domain.endsWith(".capy.ai");
+}
 async function readCookie(cdp) {
   for (const method of ["Network.getAllCookies", "Storage.getCookies"]) {
     let result;
@@ -1637,8 +1840,11 @@ async function readCookie(cdp) {
       if (!cookie || typeof cookie !== "object")
         continue;
       const value = cookie;
-      if (value.name === "__client" && typeof value.value === "string")
-        return value.value;
+      if (value.name !== "__client" || typeof value.value !== "string")
+        continue;
+      if (!isCapyCookieDomain(value.domain))
+        continue;
+      return value.value;
     }
   }
   return "";
@@ -1710,7 +1916,7 @@ async function chromiumLogin(options = {}) {
     let port = 0;
     for (let attempt = 0;attempt < 3 && !port; attempt += 1) {
       const tryPort = attempt === 0 ? 0 : await freePort();
-      child = spawn(exe, launchArgs(tryPort, profile), { stdio: "ignore", windowsHide: false });
+      child = spawn2(exe, launchArgs(tryPort, profile), { stdio: "ignore", windowsHide: false });
       if (tryPort === 0) {
         port = await waitDevToolsFile(profile, signal, 15000);
         if (!port) {
@@ -1782,20 +1988,29 @@ async function chromiumLogin(options = {}) {
     try {
       child?.kill("SIGTERM");
     } catch {}
-    setTimeout(() => {
-      try {
-        fs2.rmSync(profile, { recursive: true, force: true });
-      } catch {}
-    }, 1000).unref?.();
+    try {
+      fs2.rmSync(profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    } catch (error) {
+      options.logger?.warn("browser profile cleanup failed", {
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 }
 
 class CapyLoginSources {
+  logger;
+  constructor(logger) {
+    this.logger = logger;
+  }
   async local() {
     return readCapyInstall();
   }
   async browser(signal) {
-    return chromiumLogin({ ...signal ? { signal } : {} });
+    return chromiumLogin({
+      ...signal ? { signal } : {},
+      ...this.logger ? { logger: this.logger } : {}
+    });
   }
 }
 function abortError() {
@@ -1822,6 +2037,30 @@ function sleep(ms, signal) {
 }
 
 // src/adapters/capy/cookie-login.ts
+function looksLikeJson(text) {
+  return text.startsWith("[") || text.startsWith("{");
+}
+function dedupe(pairs) {
+  const seen = new Set;
+  const out = [];
+  for (const pair of pairs) {
+    if (seen.has(pair[0]))
+      continue;
+    seen.add(pair[0]);
+    out.push(pair);
+  }
+  return out;
+}
+function serialize(pairs) {
+  return pairs.map(([name, value]) => `${name}=${value}`).join("; ");
+}
+function sessionPairsOf(text) {
+  if (!text.includes("=")) {
+    const isJwt = text.startsWith("eyJ") || text.split(".").length === 3;
+    return [[isJwt ? "__session" : "sessionId", text]];
+  }
+  return [...pairsOf(text)];
+}
 function pairsOf(input) {
   const text = input.trim();
   if (!text)
@@ -1845,6 +2084,9 @@ function pairsOf(input) {
     }
   } else if (value && typeof value === "object") {
     const record = value;
+    if (typeof record.name === "string" && typeof record.value === "string") {
+      return new Map([[record.name, record.value]]);
+    }
     if (typeof record.cookie === "string")
       return pairsOf(record.cookie);
     if (Array.isArray(record.cookies)) {
@@ -1888,10 +2130,11 @@ function combineCookieInputs(clerkCookie, sessionCookie) {
     return second;
   if (!second)
     return first;
-  if (first.startsWith("[") || first.startsWith("{"))
-    return first;
-  if (second.startsWith("[") || second.startsWith("{"))
-    return second;
+  if (looksLikeJson(first) || looksLikeJson(second)) {
+    const firstPairs = looksLikeJson(first) ? [...pairsOf(first)] : sessionPairsOf(first);
+    const secondPairs = looksLikeJson(second) ? [...pairsOf(second)] : sessionPairsOf(second);
+    return serialize(dedupe([...firstPairs, ...secondPairs]));
+  }
   if (!second.includes("=")) {
     const isJwt = second.startsWith("eyJ") || second.split(".").length === 3;
     return isJwt ? `${first}; __session=${second}` : `${first}; sessionId=${second}`;
@@ -1899,20 +2142,23 @@ function combineCookieInputs(clerkCookie, sessionCookie) {
   return `${first}; ${second}`;
 }
 function cookieCredentialOf(input) {
-  const cookies = pairsOf(input);
+  const cookies = new Map(dedupe([...pairsOf(input)]));
   const clientEntry = [...cookies].find(([name]) => name === "__client");
   const clientJwt = clientEntry?.[1] ?? "";
   if (!clientJwt)
     throw new CapyError("sign_in_required", "Cookie \u7F3A\u5C11 __client\uFF1B\u8BF7\u5728\u7B2C\u4E00\u6846\u7C98\u8D34\u53D1\u5F80 clerk.capy.ai \u7684\u8BF7\u6C42\u7684\u5B8C\u6574 cookie \u8BF7\u6C42\u5934\uFF08F12 \u2192 Network\uFF08\u7F51\u7EDC\uFF09\u2192 clerk.capy.ai \u8BF7\u6C42 \u2192 Request Headers\uFF08\u8BF7\u6C42\u6807\u5934\uFF09\uFF09");
   jwtPayload2(clientJwt, "__client");
   const clientId = clientIdOf(clientJwt).trim();
-  if (!clientId)
-    throw new CapyError("sign_in_required", "__client \u7F3A\u5C11 Clerk client id");
   const active = [...cookies].find(([name]) => name === "clerk_active_context")?.[1] ?? "";
   let sessionId = active.split(":", 1)[0]?.trim() ?? "";
+  let opaqueSession = "";
   for (const sessionJwt of [cookies.get("__session"), ...[...cookies].filter(([name]) => /^__session_[A-Za-z0-9_]+$/u.test(name)).map(([, value]) => value)]) {
     if (sessionId || !sessionJwt)
       continue;
+    if (sessionJwt.split(".").length !== 3) {
+      opaqueSession ||= sessionJwt;
+      continue;
+    }
     try {
       const session = jwtPayload2(sessionJwt, "__session");
       sessionId = typeof session.sid === "string" ? session.sid.trim() : "";
@@ -1920,21 +2166,250 @@ function cookieCredentialOf(input) {
   }
   if (!sessionId)
     sessionId = cookies.get("sessionId")?.trim() ?? "";
+  if (!sessionId && opaqueSession)
+    sessionId = opaqueSession;
   if (!sessionId)
     throw new CapyError("sign_in_required", "Cookie \u7F3A\u5C11\u4F1A\u8BDD\u4FE1\u606F\uFF1A\u8BF7\u5728\u7B2C\u4E8C\u6846\u7C98\u8D34 __session \u7684\u503C\uFF08\u6216 Clerk session id\uFF09\uFF0C\u6216\u5728\u7B2C\u4E00\u6846\u7684 Cookie \u4E32\u672B\u5C3E\u8FFD\u52A0 ; sessionId=\u2026");
   return { clientJwt, sessionId, userId: "", clientId, source: "cookie" };
 }
 
 // src/adapters/capy/device-tunnel.ts
-import { spawn as spawn2 } from "child_process";
-import { createHash } from "crypto";
-import fs3 from "fs";
+import { spawn as spawn3 } from "child_process";
+import { createHash, randomBytes } from "crypto";
+import fs4 from "fs";
 import os4 from "os";
-import path3 from "path";
+import path4 from "path";
 
 // src/domain/account.ts
 function accountKey(session) {
   return `${session.uid || session.accountId}@${session.orgId}`;
+}
+
+// src/adapters/capy/machine-capability.ts
+var DEFAULT_MACHINE_CAPABILITY = "files";
+var MACHINE_TOOLS_ENV = "MAGPIE_CAPY_MACHINE_TOOLS";
+var FILE_HANDLERS = [
+  "worktree_ensure",
+  "worktree_list",
+  "read",
+  "file_read",
+  "write",
+  "edit",
+  "file_write"
+];
+var UNIMPLEMENTED_HANDLERS = ["bash_output", "volume_landed", "volume_probe"];
+var FULL_ONLY_HANDLERS = ["bash"];
+function machineCapabilityOf(env, onWarn) {
+  const raw = String(env[MACHINE_TOOLS_ENV] ?? "").trim().toLowerCase();
+  if (!raw)
+    return DEFAULT_MACHINE_CAPABILITY;
+  if (raw === "off" || raw === "files" || raw === "full")
+    return raw;
+  onWarn?.(`${MACHINE_TOOLS_ENV}=${raw} \u4E0D\u662F off|files|full\uFF0C\u6309 ${DEFAULT_MACHINE_CAPABILITY} \u5904\u7406`);
+  return DEFAULT_MACHINE_CAPABILITY;
+}
+function allowedHandlers(capability) {
+  if (capability === "off")
+    return new Set;
+  if (capability === "files")
+    return new Set(FILE_HANDLERS);
+  return new Set([...FILE_HANDLERS, ...FULL_ONLY_HANDLERS]);
+}
+function refusalFor(handler, capability) {
+  const name = String(handler ?? "").trim();
+  if (!name)
+    return unavailableMessage("unknown");
+  if (UNIMPLEMENTED_HANDLERS.includes(name))
+    return unavailableMessage(name);
+  if (capability === "off") {
+    return `\u6240\u6709\u673A\u5668\u5DE5\u5177\u5DF2\u7981\u7528\uFF08${MACHINE_TOOLS_ENV}=off\uFF0C\u91CD\u542F\u540E\u751F\u6548\uFF09`;
+  }
+  if (FULL_ONLY_HANDLERS.includes(name) && capability !== "full") {
+    return `\u547D\u4EE4\u6267\u884C\u5DF2\u7981\u7528\uFF1B\u9700\u8981\u65F6\u8BBE ${MACHINE_TOOLS_ENV}=full \u5E76\u91CD\u542F`;
+  }
+  if (!allowedHandlers(capability).has(name))
+    return unavailableMessage(name);
+  return null;
+}
+function unavailableMessage(handler) {
+  return `\u65E0\u5934\u8BBE\u5907\u672A\u5B9E\u73B0 ${handler}\uFF1B\u6D4F\u89C8\u5668/computer \u7B49\u5DE5\u5177\u4E0D\u4F1A\u6267\u884C\u3002`;
+}
+function shouldWarnFull(capability) {
+  return capability === "full";
+}
+
+// src/adapters/capy/machine-path.ts
+import fs3 from "fs";
+import path3 from "path";
+function implOf(platform) {
+  return platform === "win32" ? path3.win32 : path3.posix;
+}
+function fold(value, platform) {
+  return platform === "win32" ? value.toLowerCase() : value;
+}
+function refuse(reason) {
+  return { ok: false, reason };
+}
+function isInside(base, target, platform = process.platform) {
+  const p = implOf(platform);
+  const rel = p.relative(fold(base, platform), fold(target, platform));
+  if (rel === "")
+    return true;
+  return rel !== ".." && !rel.startsWith(`..${p.sep}`) && !p.isAbsolute(rel);
+}
+function walkWithinRoot(baseReal, abs, platform, p) {
+  const rest = p.relative(baseReal, abs);
+  const segments = rest === "" ? [] : rest.split(p.sep).filter((segment) => segment !== "" && segment !== ".");
+  let current = baseReal;
+  let finalIsSymlink = false;
+  let allExist = true;
+  for (let index = 0;index < segments.length; index += 1) {
+    const segment = segments[index];
+    const next = p.join(current, segment);
+    if (!allExist) {
+      current = next;
+      continue;
+    }
+    let stat;
+    try {
+      stat = fs3.lstatSync(next);
+    } catch {
+      allExist = false;
+      current = next;
+      continue;
+    }
+    if (stat.isSymbolicLink()) {
+      let target;
+      try {
+        target = fs3.realpathSync(next);
+      } catch {
+        return { ok: false, reason: "dangling symlink" };
+      }
+      if (!isInside(baseReal, target, platform)) {
+        return { ok: false, reason: "symlink escapes worktree root" };
+      }
+      current = target;
+      finalIsSymlink = index === segments.length - 1;
+      continue;
+    }
+    if (index < segments.length - 1 && !stat.isDirectory()) {
+      return { ok: false, reason: "not a directory" };
+    }
+    current = next;
+    finalIsSymlink = false;
+  }
+  return { ok: true, real: current, exists: allExist, finalIsSymlink };
+}
+function confine(root, raw, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const p = implOf(platform);
+  const value = String(raw ?? "").trim();
+  if (!value)
+    return refuse("path is required");
+  if (value.includes("\x00"))
+    return refuse("path contains NUL");
+  if (platform === "win32") {
+    if (/^[\\/]{2}/u.test(value))
+      return refuse("UNC/device path not allowed");
+    if (/^[A-Za-z]:(?![\\/])/u.test(value))
+      return refuse("drive-relative path not allowed");
+  }
+  const baseAbs = p.resolve(root);
+  try {
+    if (!fs3.existsSync(baseAbs))
+      fs3.mkdirSync(baseAbs, { recursive: true, mode: 448 });
+  } catch {
+    return refuse("worktree root is not writable");
+  }
+  let baseReal;
+  try {
+    baseReal = fs3.realpathSync(baseAbs);
+  } catch {
+    return refuse("worktree root is not readable");
+  }
+  const abs = p.resolve(baseReal, value);
+  if (!isInside(baseReal, abs, platform))
+    return refuse("outside worktree root");
+  const walked = walkWithinRoot(baseReal, abs, platform, p);
+  if (!walked.ok)
+    return refuse(walked.reason);
+  if (walked.finalIsSymlink && options.denySymlinkTarget) {
+    return refuse("refusing to write through symlink");
+  }
+  if (walked.exists)
+    return { ok: true, abs, real: walked.real };
+  if (options.mustExist)
+    return refuse("not found");
+  return { ok: true, abs, real: walked.real };
+}
+var WORKTREE_ROOT_HEADERS = ["x-capy-jam-id", "x-capy-thread-id"];
+var ROOT_TTL_MS = 30 * 60000;
+var ROOT_CAPACITY = 64;
+function headerValue(headers, name) {
+  const wanted = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === wanted)
+      return String(value);
+  }
+  return "";
+}
+function jamIdOf(headers) {
+  for (const name of WORKTREE_ROOT_HEADERS) {
+    const value = headerValue(headers, name).trim();
+    if (value)
+      return value.slice(0, 200);
+  }
+  return "";
+}
+
+class JamRootRegistry {
+  entries = new Map;
+  ttlMs;
+  capacity;
+  now;
+  constructor(options = {}) {
+    this.ttlMs = Math.max(1000, options.ttlMs ?? ROOT_TTL_MS);
+    this.capacity = Math.max(1, options.capacity ?? ROOT_CAPACITY);
+    this.now = options.now ?? (() => Date.now());
+  }
+  get size() {
+    return this.entries.size;
+  }
+  set(jamId, root) {
+    if (!jamId)
+      return;
+    this.entries.delete(jamId);
+    this.entries.set(jamId, { root, at: this.now() });
+    while (this.entries.size > this.capacity) {
+      const oldest = this.entries.keys().next();
+      if (oldest.done)
+        break;
+      this.entries.delete(oldest.value);
+    }
+  }
+  get(jamId) {
+    if (!jamId)
+      return;
+    const entry = this.entries.get(jamId);
+    if (!entry)
+      return;
+    if (this.now() - entry.at > this.ttlMs) {
+      this.entries.delete(jamId);
+      return;
+    }
+    this.entries.delete(jamId);
+    this.entries.set(jamId, entry);
+    return entry.root;
+  }
+  clear() {
+    this.entries.clear();
+  }
+}
+function resolveMachineRoot(headers, base, registry) {
+  const jamId = jamIdOf(headers);
+  if (!jamId)
+    return base;
+  return registry.get(jamId) ?? base;
 }
 
 // src/adapters/capy/device-tunnel.ts
@@ -1942,6 +2417,12 @@ var HEADLESS_NAME = "magpie-headless";
 var READY_TIMEOUT_MS = 15000;
 var CONNECT_POLL_MS = 400;
 var STATE_VERSION = 1;
+var MAX_READ_BYTES = 8 * 1024 * 1024;
+var MAX_STREAM_BYTES = 32 * 1024 * 1024;
+var MAX_CONCURRENT_STREAMS = 16;
+var STREAM_IDLE_TIMEOUT_MS = 60000;
+var BASH_OUTPUT_LIMIT = 4 * 1024 * 1024;
+var AUDIT_COMMAND_LIMIT = 200;
 function deviceOs2() {
   if (process.platform === "win32")
     return "win32";
@@ -1969,33 +2450,45 @@ function defaultDeviceName() {
   const raw = host || user || "capy-headless";
   return raw.replace(/[^A-Za-z0-9._@-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 80) || "capy-headless";
 }
+function resolveWorktreeBase(explicit) {
+  const raw = explicit?.trim() || process.env.MAGPIE_CAPY_WORKTREE_BASE?.trim() || "";
+  if (!raw)
+    return path4.join(os4.homedir(), ".capy", "worktrees");
+  if (raw.startsWith("~/"))
+    return path4.join(os4.homedir(), raw.slice(2));
+  return raw;
+}
 function stateDir() {
   const override = String(process.env.MAGPIE_CAPY_STATE_DIR ?? "").trim();
   if (override)
-    return path3.resolve(override);
+    return path4.resolve(override);
   if (process.platform === "win32") {
-    return path3.join(process.env.LOCALAPPDATA || path3.join(os4.homedir(), "AppData", "Local"), "magpie-capy");
+    return path4.join(process.env.LOCALAPPDATA || path4.join(os4.homedir(), "AppData", "Local"), "magpie-capy");
   }
   if (process.platform === "darwin") {
-    return path3.join(os4.homedir(), "Library", "Application Support", "magpie-capy");
+    return path4.join(os4.homedir(), "Library", "Application Support", "magpie-capy");
   }
-  return path3.join(process.env.XDG_STATE_HOME || path3.join(os4.homedir(), ".local", "state"), "magpie-capy");
+  return path4.join(process.env.XDG_STATE_HOME || path4.join(os4.homedir(), ".local", "state"), "magpie-capy");
 }
 
 class FileSecretStore {
   baseDir;
-  constructor(baseDir = stateDir()) {
+  onWarn;
+  prepared = false;
+  warnedPlaintext = false;
+  constructor(baseDir = stateDir(), options = {}) {
     this.baseDir = baseDir;
+    this.onWarn = options.onWarn;
   }
   async load(account) {
     try {
-      const doc = JSON.parse(fs3.readFileSync(this.fileOf(account), "utf8"));
+      const doc = JSON.parse(fs4.readFileSync(this.fileOf(account), "utf8"));
       if (doc.version !== STATE_VERSION)
         return null;
       const orgId = String(doc.orgId ?? "");
       const deviceId = String(doc.deviceId ?? "");
       const name = String(doc.name ?? HEADLESS_NAME);
-      const token = typeof doc.token === "string" ? doc.token : typeof doc.tokenCiphertext === "string" ? dpapiUnprotect(Buffer.from(doc.tokenCiphertext, "base64")).toString("utf8") : "";
+      const token = typeof doc.token === "string" ? doc.token : typeof doc.tokenCiphertext === "string" ? (await dpapiUnprotect(Buffer.from(doc.tokenCiphertext, "base64"))).toString("utf8") : "";
       if (!orgId || !deviceId || !token.startsWith("capyd_"))
         return null;
       return { orgId, deviceId, name, token };
@@ -2004,35 +2497,76 @@ class FileSecretStore {
     }
   }
   async save(account, credential) {
-    fs3.mkdirSync(this.baseDir, { recursive: true });
+    this.prepare();
     const file = this.fileOf(account);
-    const tmp = `${file}.${process.pid}.tmp`;
-    const secret = process.platform === "win32" ? { tokenCiphertext: dpapiProtect(credential.token) } : { token: credential.token };
-    fs3.writeFileSync(tmp, JSON.stringify({
+    const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+    const secret = process.platform === "win32" ? { tokenCiphertext: await dpapiProtect(credential.token) } : { token: credential.token };
+    fs4.writeFileSync(tmp, JSON.stringify({
       version: STATE_VERSION,
       orgId: credential.orgId,
       deviceId: credential.deviceId,
       name: credential.name,
       ...secret
     }, null, 2), { mode: 384 });
-    fs3.renameSync(tmp, file);
     if (process.platform !== "win32") {
       try {
-        fs3.chmodSync(file, 384);
+        fs4.chmodSync(tmp, 384);
       } catch {}
     }
+    fs4.renameSync(tmp, file);
+    if (process.platform !== "win32") {
+      try {
+        fs4.chmodSync(file, 384);
+      } catch {}
+    }
+    this.warnPlaintextOnce(file);
   }
   async clear(account) {
     try {
-      fs3.unlinkSync(this.fileOf(account));
+      fs4.unlinkSync(this.fileOf(account));
     } catch {}
+  }
+  prepare() {
+    if (this.prepared)
+      return;
+    this.prepared = true;
+    try {
+      fs4.mkdirSync(this.baseDir, { recursive: true, mode: 448 });
+    } catch {}
+    if (process.platform !== "win32") {
+      try {
+        fs4.chmodSync(this.baseDir, 448);
+      } catch {}
+    }
+    this.cleanupTemps();
+  }
+  cleanupTemps() {
+    let names;
+    try {
+      names = fs4.readdirSync(this.baseDir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (!name.endsWith(".tmp"))
+        continue;
+      try {
+        fs4.unlinkSync(path4.join(this.baseDir, name));
+      } catch {}
+    }
+  }
+  warnPlaintextOnce(file) {
+    if (this.warnedPlaintext || process.platform === "win32")
+      return;
+    this.warnedPlaintext = true;
+    this.onWarn?.(`\u8BBE\u5907 token \u4EE5\u660E\u6587\u4FDD\u5B58\u5728 ${file}\uFF08\u975E Windows \u6CA1\u6709 DPAPI\uFF1B\u76EE\u5F55 0700\u3001\u6587\u4EF6 0600 \u5DF2\u8BBE\u7F6E\uFF09`);
   }
   fileOf(account) {
     const safe = account.replace(/[^A-Za-z0-9._-]+/gu, "_").slice(0, 120);
-    return path3.join(this.baseDir, `headless-${safe}.json`);
+    return path4.join(this.baseDir, `headless-${safe}.json`);
   }
 }
-function headerValue(headers, name) {
+function headerValue2(headers, name) {
   const wanted = name.toLowerCase();
   for (const [key, value] of Object.entries(headers)) {
     if (key.toLowerCase() === wanted)
@@ -2069,27 +2603,72 @@ function fileFailure(error) {
     return fail("MachineServer.FileError", `permission-denied: ${message}`);
   return fail("MachineServer.FileError", `other: ${message}`);
 }
-function resolveIn(cwd, raw) {
-  const value = String(raw ?? "").trim();
-  if (!value)
-    throw new Error("path is required");
-  return path3.isAbsolute(value) ? path3.normalize(value) : path3.resolve(cwd, value);
+function contextOf(value) {
+  if (typeof value === "string") {
+    const base = path4.resolve(value);
+    return { base, root: base };
+  }
+  const base = path4.resolve(value.base);
+  const root = path4.resolve(value.root || value.base);
+  return { ...value, base, root };
 }
-function sha256(text) {
+function sha256OfText(text) {
   return createHash("sha256").update(text).digest("hex");
 }
-async function runBash(params, cwd) {
-  const command = String(params.command ?? "");
-  if (!command.trim())
-    return fail("MachineServer.Bash", "bash command is empty");
-  const timeoutSeconds = Math.max(1, Math.min(600, Number(params.timeoutSeconds) || 120));
-  const runCwd = path3.resolve(cwd);
+function sha256OfFile(file) {
+  const hash = createHash("sha256");
+  const fd = fs4.openSync(file, "r");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
   try {
-    fs3.mkdirSync(runCwd, { recursive: true });
-  } catch {}
-  const shell = String(process.env.MAGPIE_CAPY_BASH ?? "").trim() || "bash";
-  const env = {
-    ...process.env,
+    for (;; ) {
+      const read = fs4.readSync(fd, buffer, 0, buffer.length, null);
+      if (read <= 0)
+        break;
+      hash.update(buffer.subarray(0, read));
+    }
+  } finally {
+    fs4.closeSync(fd);
+  }
+  return hash.digest("hex");
+}
+var BASH_ENV_ALLOW = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "USERNAME",
+  "USERPROFILE",
+  "SHELL",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "SystemRoot",
+  "SystemDrive",
+  "WINDIR",
+  "ComSpec",
+  "PATHEXT",
+  "LOCALAPPDATA",
+  "APPDATA",
+  "PROGRAMDATA",
+  "PROGRAMFILES",
+  "PROGRAMFILES(X86)",
+  "PROGRAMW6432",
+  "PROCESSOR_ARCHITECTURE",
+  "NUMBER_OF_PROCESSORS"
+];
+var BASH_ENV_DENY = /(?:key|token|secret|password|passwd|credential|auth|cookie|capy|magpie|proxy|api)/iu;
+function bashEnv(source) {
+  const env = {};
+  for (const name of BASH_ENV_ALLOW) {
+    const value = source[name];
+    if (typeof value === "string" && value && !BASH_ENV_DENY.test(name))
+      env[name] = value;
+  }
+  return {
+    ...env,
     PS1: "",
     NO_COLOR: "1",
     TERM: "dumb",
@@ -2100,8 +2679,41 @@ async function runBash(params, cwd) {
     GH_PAGER: "cat",
     COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
   };
-  const startedAt = Date.now();
-  const maxChars = 4 * 1024 * 1024;
+}
+function summarizeCommand(command) {
+  const text = command.replace(/\s+/gu, " ").trim();
+  return text.length > AUDIT_COMMAND_LIMIT ? `${text.slice(0, AUDIT_COMMAND_LIMIT)}\u2026` : text;
+}
+function killProcessGroup(child, detached) {
+  const pid = child.pid;
+  if (detached && typeof pid === "number") {
+    try {
+      process.kill(-pid, "SIGKILL");
+      return;
+    } catch {}
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {}
+  if (process.platform === "win32" && pid) {
+    try {
+      spawn3("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }).unref();
+    } catch {}
+  }
+}
+async function runBash(params, ctx) {
+  const command = String(params.command ?? "");
+  if (!command.trim())
+    return fail("MachineServer.Bash", "bash command is empty");
+  const timeoutSeconds = Math.max(1, Math.min(600, Number(params.timeoutSeconds) || 120));
+  const runCwd = path4.resolve(ctx.root || ctx.base);
+  try {
+    fs4.mkdirSync(runCwd, { recursive: true, mode: 448 });
+  } catch {}
+  const shell = String(ctx.shell ?? process.env.MAGPIE_CAPY_BASH ?? "").trim() || "bash";
+  const env = bashEnv(ctx.env ?? process.env);
+  const startedAt = (ctx.now ?? Date.now)();
+  const detached = process.platform !== "win32";
   return await new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -2109,26 +2721,19 @@ async function runBash(params, cwd) {
     let settled = false;
     let child;
     try {
-      child = spawn2(shell, ["-lc", command], { cwd: runCwd, env, windowsHide: true });
+      child = spawn3(shell, ["-c", command], { cwd: runCwd, env, windowsHide: true, detached });
     } catch (error) {
       resolve(fail("MachineServer.Bash", `Failed to start bash: ${error instanceof Error ? error.message : String(error)}`));
       return;
     }
     const append = (current, chunk) => {
-      if (current.length >= maxChars)
+      if (current.length >= BASH_OUTPUT_LIMIT)
         return current;
-      return current + chunk.toString("utf8").slice(0, maxChars - current.length);
+      return current + chunk.toString("utf8").slice(0, BASH_OUTPUT_LIMIT - current.length);
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-      if (process.platform === "win32" && child.pid) {
-        try {
-          spawn2("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }).unref();
-        } catch {}
-      }
+      killProcessGroup(child, detached);
     }, timeoutSeconds * 1000);
     timer.unref?.();
     child.stdout?.on("data", (chunk) => {
@@ -2149,139 +2754,209 @@ async function runBash(params, cwd) {
         return;
       settled = true;
       clearTimeout(timer);
+      const exitCode = typeof code === "number" ? code : -1;
+      const durationMs = (ctx.now ?? Date.now)() - startedAt;
+      try {
+        ctx.audit?.({
+          handler: "bash",
+          command: summarizeCommand(command),
+          durationMs,
+          exitCode
+        });
+      } catch {}
       resolve(ok({
         kind: "bash",
         stdout,
         stderr,
-        exitCode: typeof code === "number" ? code : -1,
-        durationMs: Date.now() - startedAt,
+        exitCode,
+        durationMs,
         timedOut,
-        isError: timedOut,
+        isError: timedOut || exitCode !== 0,
         ...timedOut ? { landingNote: "Command timed out and was stopped." } : {}
       }));
     });
   });
 }
-async function machineResult(handler, params, worktreeBase) {
-  if (handler === "worktree_ensure") {
-    const root = String(params.root ?? "");
-    let created = false;
-    if (root) {
-      const base = path3.resolve(worktreeBase);
-      const resolved = path3.resolve(root);
-      if (resolved !== base && !resolved.startsWith(`${base}${path3.sep}`)) {
-        return fail("MachineServer.Refused", "worktree root outside worktreeBase");
+function confineOrRefuse(root, raw, options = {}) {
+  const confined = confine(root, raw, {
+    ...options.mustExist ? { mustExist: true } : {},
+    ...options.denySymlinkTarget ? { denySymlinkTarget: true } : {}
+  });
+  if (confined.ok)
+    return { ok: true, real: confined.real };
+  const code = confined.reason === "not found" ? "MachineServer.FileError" : "MachineServer.Refused";
+  return fail(code, confined.reason);
+}
+function writeFileSafely(file, content) {
+  const dir = path4.dirname(file);
+  const tmp = path4.join(dir, `.capy-tmp-${process.pid}-${randomBytes(6).toString("hex")}`);
+  fs4.writeFileSync(tmp, content, { encoding: "utf8", mode: 384 });
+  try {
+    try {
+      if (fs4.lstatSync(file).isSymbolicLink()) {
+        throw Object.assign(new Error("refusing to write through symlink"), { code: "ELOOP" });
       }
-      created = !fs3.existsSync(resolved);
-      fs3.mkdirSync(resolved, { recursive: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") {} else {
+        throw error;
+      }
+    }
+    fs4.renameSync(tmp, file);
+  } catch (error) {
+    try {
+      fs4.unlinkSync(tmp);
+    } catch {}
+    throw error;
+  }
+}
+function sizeOf(file) {
+  try {
+    return fs4.statSync(file).size;
+  } catch {
+    return null;
+  }
+}
+function truncateLine(line, maxChars) {
+  const points = Array.from(line);
+  return points.length > maxChars ? `${points.slice(0, maxChars).join("")}... (line truncated to ${maxChars} chars)` : line;
+}
+async function machineResult(handler, params, context) {
+  const ctx = contextOf(context);
+  const capability = ctx.capability ?? "files";
+  const refusal = refusalFor(handler, capability);
+  if (refusal)
+    return fail("MachineServer.Unavailable", refusal);
+  if (handler === "worktree_ensure") {
+    const requested = String(params.root ?? "");
+    let root = "";
+    let created = false;
+    if (requested) {
+      const confined = confineOrRefuse(ctx.base, requested);
+      if ("status" in confined)
+        return confined;
+      root = confined.real;
+      created = !fs4.existsSync(root);
+      try {
+        fs4.mkdirSync(root, { recursive: true, mode: 448 });
+      } catch (error) {
+        return fileFailure(error);
+      }
     }
     return ok({ root, created, checkouts: [] });
   }
   if (handler === "worktree_list") {
-    return ok({ kind: "worktree_list", entries: [] });
-  }
-  if (handler === "volume_landed") {
-    const mounts = Array.isArray(params.mounts) ? params.mounts : [];
-    return ok({
-      kind: "volume_landed",
-      mounts: mounts.map((mount) => ({
-        mountPath: String(mount?.mountPath ?? ""),
-        current: true
-      })),
-      landing: false,
-      checkpoints: false,
-      directories: [],
-      unretained: [],
-      handback: true
-    });
-  }
-  if (handler === "volume_probe") {
-    const mounts = Array.isArray(params.mounts) ? params.mounts : [];
-    return ok({
-      mounts: mounts.map((mount) => ({
-        mountPath: String(mount?.mountPath ?? ""),
-        state: "current"
-      }))
-    });
+    const entries = [];
+    try {
+      for (const item of fs4.readdirSync(ctx.base, { withFileTypes: true })) {
+        if (!item.isDirectory())
+          continue;
+        entries.push({ name: item.name, path: path4.join(ctx.base, item.name) });
+      }
+    } catch (error) {
+      return fileFailure(error);
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    return ok({ kind: "worktree_list", entries });
   }
   if (handler === "bash")
-    return await runBash(params, worktreeBase);
-  if (handler === "bash_output")
-    return ok({ kind: "not-running" });
+    return await runBash(params, ctx);
   if (handler === "read") {
+    const confined = confineOrRefuse(ctx.root, params.path);
+    if ("status" in confined)
+      return confined;
     try {
-      const file = resolveIn(worktreeBase, params.path);
-      const text = fs3.readFileSync(file, "utf8");
+      const stat = fs4.statSync(confined.real);
+      if (stat.isDirectory())
+        return fail("MachineServer.FileError", `is-directory: ${confined.real}`);
+      if (stat.size > MAX_READ_BYTES) {
+        return ok({ kind: "too-large", sizeBytes: stat.size, bytes: stat.size, isError: true });
+      }
+      const text = fs4.readFileSync(confined.real, "utf8");
       const offset = Math.max(1, Number(params.offset) || 1);
       const limit = Math.max(1, Math.min(1e4, Number(params.limit) || 2000));
       const maxChars = Math.max(200, Math.min(1e5, Number(params.maxChars) || 20000));
       const all = text.split(/\r?\n/u);
-      const content = all.slice(offset - 1, offset - 1 + limit).map((line) => line.length > maxChars ? `${line.slice(0, maxChars)}... (line truncated to ${maxChars} chars)` : line).join(`
+      const content = all.slice(offset - 1, offset - 1 + limit).map((line) => truncateLine(line, maxChars)).join(`
 `);
-      return ok({ kind: "read", content, offset, totalLines: all.length, isError: false });
+      return ok({ kind: "read", path: confined.real, content, offset, totalLines: all.length, isError: false });
     } catch (error) {
       return fileFailure(error);
     }
   }
   if (handler === "write") {
+    const confined = confineOrRefuse(ctx.root, params.path, { denySymlinkTarget: true });
+    if ("status" in confined)
+      return confined;
     try {
-      const file = resolveIn(worktreeBase, params.path);
       const content = String(params.content ?? "");
-      fs3.mkdirSync(path3.dirname(file), { recursive: true });
-      fs3.writeFileSync(file, content, "utf8");
-      return ok({ kind: "write", path: file, bytes: Buffer.byteLength(content), isError: false });
+      fs4.mkdirSync(path4.dirname(confined.real), { recursive: true, mode: 448 });
+      writeFileSafely(confined.real, content);
+      return ok({ kind: "write", path: confined.real, bytes: Buffer.byteLength(content), isError: false });
     } catch (error) {
       return fileFailure(error);
     }
   }
   if (handler === "edit") {
+    const confined = confineOrRefuse(ctx.root, params.path, { mustExist: true, denySymlinkTarget: true });
+    if ("status" in confined)
+      return confined;
     try {
-      const file = resolveIn(worktreeBase, params.path);
       const oldString = String(params.oldString ?? "");
       const newString = String(params.newString ?? "");
       if (!oldString || oldString === newString) {
         return fail("MachineServer.FileError", "oldString must be non-empty and differ from newString");
       }
-      const text = fs3.readFileSync(file, "utf8");
+      const size = sizeOf(confined.real) ?? 0;
+      if (size > MAX_READ_BYTES)
+        return fail("MachineServer.FileError", `file too large: ${size} bytes`);
+      const text = fs4.readFileSync(confined.real, "utf8");
       const count = text.split(oldString).length - 1;
       if (count === 0)
         return fail("MachineServer.FileError", `The text was not found in ${String(params.path)}`);
       if (count > 1 && params.replaceAll !== true) {
         return fail("MachineServer.FileError", `Found ${count} occurrences; provide more context or replaceAll`);
       }
-      const next = params.replaceAll === true ? text.split(oldString).join(newString) : text.replace(oldString, newString);
-      fs3.writeFileSync(file, next, "utf8");
-      return ok({ kind: "edit", path: file, replacements: count, isError: false });
+      const next = text.split(oldString).join(newString);
+      writeFileSafely(confined.real, next);
+      return ok({ kind: "edit", path: confined.real, replacements: count, isError: false });
     } catch (error) {
       return fileFailure(error);
     }
   }
   if (handler === "file_read") {
+    const confined = confineOrRefuse(ctx.root, params.path);
+    if ("status" in confined)
+      return confined;
+    if (!fs4.existsSync(confined.real))
+      return ok({ kind: "missing", isError: false });
     try {
-      const file = resolveIn(worktreeBase, params.path);
-      const text = fs3.readFileSync(file, "utf8");
-      return ok({ kind: "read", path: file, content: { text }, sha: sha256(text), isError: false });
+      const stat = fs4.statSync(confined.real);
+      if (stat.size > MAX_READ_BYTES) {
+        return ok({ kind: "too-large", sizeBytes: stat.size, bytes: stat.size, isError: true });
+      }
+      const text = fs4.readFileSync(confined.real, "utf8");
+      return ok({ kind: "read", path: confined.real, content: { text }, sha: sha256OfText(text), isError: false });
     } catch (error) {
-      if (error?.code === "ENOENT")
-        return ok({ kind: "missing", isError: false });
       return fileFailure(error);
     }
   }
   if (handler === "file_write") {
+    const confined = confineOrRefuse(ctx.root, params.path, { denySymlinkTarget: true });
+    if ("status" in confined)
+      return confined;
     try {
-      const file = resolveIn(worktreeBase, params.path);
       const content = String(params.content ?? "");
-      let currentSha = null;
-      try {
-        currentSha = sha256(fs3.readFileSync(file, "utf8"));
-      } catch {}
+      const size = sizeOf(confined.real) ?? 0;
+      if (size > MAX_READ_BYTES)
+        return fail("MachineServer.FileError", `file too large: ${size} bytes`);
+      const currentSha = fs4.existsSync(confined.real) ? sha256OfFile(confined.real) : null;
       const baseSha = typeof params.baseSha === "string" ? params.baseSha : null;
       if (baseSha !== null && currentSha !== baseSha) {
         return ok({ kind: "conflict", currentSha, isError: false });
       }
-      fs3.mkdirSync(path3.dirname(file), { recursive: true });
-      fs3.writeFileSync(file, content, "utf8");
-      return ok({ kind: "written", sha: sha256(content), bytes: Buffer.byteLength(content), isError: false });
+      fs4.mkdirSync(path4.dirname(confined.real), { recursive: true, mode: 448 });
+      writeFileSafely(confined.real, content);
+      return ok({ kind: "written", sha: sha256OfText(content), bytes: Buffer.byteLength(content), isError: false });
     } catch (error) {
       return fileFailure(error);
     }
@@ -2293,13 +2968,15 @@ class HeadlessDevice {
   credential;
   WebSocketImpl;
   worktreeBase;
+  capability;
+  audit;
   ws = null;
   ready = false;
   connectPromise = null;
   readyResolve = null;
   readyReject = null;
   streams = new Map;
-  activeRoot = null;
+  roots = new JamRootRegistry;
   constructor(options) {
     this.credential = options.credential;
     const Impl = options.WebSocketImpl ?? globalThis.WebSocket;
@@ -2307,7 +2984,9 @@ class HeadlessDevice {
       throw new CapyError("upstream_unavailable", "\u5F53\u524D\u8FD0\u884C\u65F6\u6CA1\u6709 WebSocket\uFF08\u9700\u8981 Bun / Node 22+\uFF09");
     }
     this.WebSocketImpl = Impl;
-    this.worktreeBase = options.worktreeBase ?? path3.join(os4.homedir(), ".capy", "worktrees");
+    this.worktreeBase = resolveWorktreeBase(options.worktreeBase);
+    this.capability = options.capability ?? "files";
+    this.audit = options.audit;
   }
   get info() {
     return {
@@ -2337,6 +3016,13 @@ class HeadlessDevice {
   }
   async connect(timeoutMs) {
     this.ready = false;
+    const old = this.ws;
+    if (old) {
+      try {
+        old.close(1000, "headless reconnect");
+      } catch {}
+      this.ws = null;
+    }
     let ws;
     try {
       ws = new this.WebSocketImpl(DEVICE_TUNNEL, {
@@ -2352,6 +3038,8 @@ class HeadlessDevice {
       this.readyReject = reject;
     });
     const timer = setTimeout(() => {
+      if (this.ws !== ws)
+        return;
       const failure = new Error(`\u8FDE\u63A5 Capy \u8BBE\u5907\u96A7\u9053\u8D85\u65F6\uFF08${Math.round(timeoutMs / 1000)}s\uFF09`);
       failure.code = "device_connect_timeout";
       this.readyReject?.(failure);
@@ -2361,19 +3049,27 @@ class HeadlessDevice {
     }, Math.max(3000, timeoutMs));
     timer.unref?.();
     ws.addEventListener("open", () => {
+      if (this.ws !== ws)
+        return;
       this.send({
         type: "hello",
         contractVersion: CONTRACT_VERSION,
         deviceId: this.credential.deviceId,
-        hostname: os4.hostname(),
+        hostname: this.credential.name || defaultDeviceName(),
         os: deviceOs2(),
         workspaces: [],
         worktreeBase: this.worktreeBase,
         clientVersion: "magpie-headless 1.0"
       });
     });
-    ws.addEventListener("message", (event) => this.onMessage(event));
+    ws.addEventListener("message", (event) => {
+      if (this.ws !== ws)
+        return;
+      this.onMessage(event);
+    });
     ws.addEventListener("close", (event) => {
+      if (this.ws !== ws)
+        return;
       this.ready = false;
       this.ws = null;
       clearTimeout(timer);
@@ -2386,6 +3082,8 @@ class HeadlessDevice {
       this.readyReject?.(failure);
     });
     ws.addEventListener("error", () => {
+      if (this.ws !== ws)
+        return;
       const failure = new Error("Capy \u8BBE\u5907\u96A7\u9053\u8FDE\u63A5\u5931\u8D25");
       failure.code = "device_connect_failed";
       this.readyReject?.(failure);
@@ -2430,9 +3128,14 @@ class HeadlessDevice {
     const stream = this.streams.get(frame.streamId);
     if (!stream)
       return;
-    stream.body = Buffer.concat([stream.body, Buffer.from(frame.body)]);
-    const length = Number(headerValue(stream.headers, "content-length") || 0);
-    if (!length || stream.body.length >= length)
+    stream.chunks.push(frame.body);
+    stream.bytes += frame.body.length;
+    if (stream.bytes > MAX_STREAM_BYTES) {
+      this.dropStream(stream, "MachineServer.Refused", `\u8BF7\u6C42\u4F53\u8D85\u8FC7 ${Math.round(MAX_STREAM_BYTES / (1024 * 1024))} MB \u4E0A\u9650`);
+      return;
+    }
+    const length = Number(headerValue2(stream.headers, "content-length") || 0);
+    if (length > 0 && stream.bytes >= length)
       this.runStream(stream);
   }
   onControl(text) {
@@ -2448,6 +3151,15 @@ class HeadlessDevice {
       return;
     }
     if (type === "session-config") {
+      const frameOrgId = typeof frame.orgId === "string" ? frame.orgId.trim() : "";
+      if (frameOrgId && frameOrgId !== this.credential.orgId) {
+        const failure = new CapyError("device_pair_failed", `Capy \u96A7\u9053\u4E0B\u53D1\u7684\u7EC4\u7EC7\uFF08${frameOrgId}\uFF09\u4E0E\u914D\u5BF9\u7EC4\u7EC7\uFF08${this.credential.orgId}\uFF09\u4E0D\u4E00\u81F4`);
+        this.readyReject?.(failure);
+        try {
+          this.ws?.close(4003, "org mismatch");
+        } catch {}
+        return;
+      }
       this.send({ type: "workspaces-changed", workspaces: [] });
       this.send({ type: "ready" });
       this.readyResolve?.();
@@ -2457,14 +3169,28 @@ class HeadlessDevice {
       const streamId = Number(frame.streamId);
       if (!Number.isInteger(streamId))
         return;
-      this.streams.set(streamId, {
+      if (this.streams.size >= MAX_CONCURRENT_STREAMS) {
+        this.respond(streamId, 200, fail("MachineServer.Refused", `\u5E76\u53D1\u6D41\u8D85\u8FC7 ${MAX_CONCURRENT_STREAMS} \u4E0A\u9650`));
+        return;
+      }
+      const stream = {
         streamId,
         kind: String(frame.kind ?? "invoke"),
         method: String(frame.method ?? "POST"),
         path: String(frame.path ?? ""),
         headers: frame.headers && typeof frame.headers === "object" ? frame.headers : {},
-        body: Buffer.alloc(0)
-      });
+        chunks: [],
+        bytes: 0,
+        timer: null
+      };
+      stream.timer = setTimeout(() => {
+        const current = this.streams.get(streamId);
+        if (current === stream) {
+          this.dropStream(stream, "MachineServer.Timeout", "60s \u5185\u6CA1\u6709\u6536\u5230\u5B8C\u6574\u8BF7\u6C42\u4F53");
+        }
+      }, STREAM_IDLE_TIMEOUT_MS);
+      stream.timer.unref?.();
+      this.streams.set(streamId, stream);
       return;
     }
     if (type === "close") {
@@ -2474,7 +3200,19 @@ class HeadlessDevice {
         this.runStream(stream);
     }
   }
+  releaseStream(stream) {
+    if (stream.timer) {
+      clearTimeout(stream.timer);
+      stream.timer = null;
+    }
+    this.streams.delete(stream.streamId);
+  }
+  dropStream(stream, code, message) {
+    this.releaseStream(stream);
+    this.respond(stream.streamId, 200, fail(code, message));
+  }
   runStream(stream) {
+    this.releaseStream(stream);
     this.handleStream(stream).catch((error) => {
       this.respond(stream.streamId, 200, {
         status: "failed",
@@ -2483,10 +3221,10 @@ class HeadlessDevice {
     });
   }
   async handleStream(stream) {
-    this.streams.delete(stream.streamId);
+    const body = stream.chunks.length > 0 ? Buffer.concat(stream.chunks, stream.bytes) : Buffer.alloc(0);
     let payload = null;
     try {
-      payload = stream.body.length > 0 ? JSON.parse(stream.body.toString("utf8")) : null;
+      payload = body.length > 0 ? JSON.parse(body.toString("utf8")) : null;
     } catch {}
     const record = payload && typeof payload === "object" ? payload : {};
     let result;
@@ -2495,11 +3233,18 @@ class HeadlessDevice {
     } else if (stream.path.startsWith("/v1/invocations")) {
       const handler = String(record.handler ?? "");
       const params = record.params && typeof record.params === "object" ? record.params : {};
-      result = await machineResult(handler, params, this.activeRoot ?? this.worktreeBase);
+      const root = resolveMachineRoot(stream.headers, this.worktreeBase, this.roots);
+      result = await machineResult(handler, params, {
+        base: this.worktreeBase,
+        root,
+        capability: this.capability,
+        ...this.audit ? { audit: this.audit } : {}
+      });
       if (handler === "worktree_ensure" && result.status === "succeeded") {
-        const root = String(params.root ?? "");
-        if (root)
-          this.activeRoot = root;
+        const created = result.result?.root;
+        const jamId = jamIdOf(stream.headers);
+        if (jamId && typeof created === "string" && created)
+          this.roots.set(jamId, created);
       }
     } else {
       result = fail("MachineServer.Unavailable", `\u672A\u5B9E\u73B0\u7684\u8DEF\u5F84 ${stream.path}`);
@@ -2537,6 +3282,7 @@ class HeadlessDeviceRuntime {
   clock;
   logger;
   deviceName;
+  capability;
   devices = new Map;
   inflight = new Map;
   constructor(options) {
@@ -2545,6 +3291,12 @@ class HeadlessDeviceRuntime {
     this.clock = options.clock;
     this.logger = options.logger;
     this.deviceName = options.deviceName?.trim() || defaultDeviceName();
+    this.capability = machineCapabilityOf(options.env ?? process.env, (message) => {
+      this.logger?.warn(message);
+    });
+    if (shouldWarnFull(this.capability)) {
+      this.logger?.warn("MAGPIE_CAPY_MACHINE_TOOLS=full\uFF1A\u8BBE\u5907\u4F1A\u6267\u884C\u8FDC\u7AEF\u4E0B\u53D1\u7684\u4EFB\u610F shell \u547D\u4EE4");
+    }
   }
   async ensure(session, signal) {
     const key = accountKey(session);
@@ -2558,6 +3310,12 @@ class HeadlessDeviceRuntime {
     } finally {
       this.inflight.delete(key);
     }
+  }
+  peek(session) {
+    const hit = this.devices.get(accountKey(session));
+    if (hit)
+      return hit.info;
+    return { id: "", name: this.deviceName, connected: false };
   }
   close() {
     for (const device of this.devices.values())
@@ -2579,7 +3337,9 @@ class HeadlessDeviceRuntime {
     const jwt = await this.app.sessionJwt(session.clerk, signal);
     let credential = await this.store.load(key);
     if (!credential || credential.orgId !== session.orgId) {
+      const oldDeviceId = credential?.deviceId;
       credential = await this.pair(session, jwt, signal);
+      this.noteReplacedDevice(oldDeviceId, credential.deviceId);
     } else if (credential.name !== this.deviceName) {
       try {
         await this.app.renameDevice(jwt, session.orgId, credential.deviceId, this.deviceName, signal);
@@ -2598,7 +3358,9 @@ class HeadlessDeviceRuntime {
     } catch (error) {
       if (!tokenRejected(error))
         throw error;
+      const oldDeviceId = credential.deviceId;
       credential = await this.pair(session, jwt, signal);
+      this.noteReplacedDevice(oldDeviceId, credential.deviceId);
       device = await this.connect(credential, signal);
     }
     const connected = await this.waitConnected(jwt, session.orgId, credential.deviceId, signal);
@@ -2609,13 +3371,22 @@ class HeadlessDeviceRuntime {
     this.devices.set(key, device);
     return { id: credential.deviceId, name: credential.name, connected: true };
   }
+  noteReplacedDevice(oldDeviceId, newDeviceId) {
+    if (!oldDeviceId || oldDeviceId === newDeviceId)
+      return;
+    this.logger?.warn("capy device replaced; delete the old device manually", { oldDeviceId, deviceId: newDeviceId });
+  }
   infoOf(device) {
     return device.info;
   }
   async connect(credential, signal) {
     let lastError = null;
     for (let attempt = 1;attempt <= 3; attempt += 1) {
-      const device = new HeadlessDevice({ credential });
+      const device = new HeadlessDevice({
+        credential,
+        capability: this.capability,
+        ...this.logger ? { audit: (entry) => this.logger?.event("machine_audit", { ...entry }) } : {}
+      });
       try {
         await device.ensure();
         return device;
@@ -2636,7 +3407,7 @@ class HeadlessDeviceRuntime {
   }
   async pair(session, jwt, signal) {
     const start = await this.app.startDeviceCode(jwt, {
-      hostname: os4.hostname(),
+      hostname: this.deviceName,
       os: deviceOs2(),
       arch: deviceArch2()
     }, signal);
@@ -2657,6 +3428,9 @@ class HeadlessDeviceRuntime {
         continue;
       }
       if (poll.status === "approved") {
+        if (poll.enrolled.orgId && poll.enrolled.orgId !== session.orgId) {
+          throw new CapyError("device_pair_failed", `Capy \u8BBE\u5907\u7801\u914D\u5BF9\u5230\u4E86\u53E6\u4E00\u4E2A\u7EC4\u7EC7\uFF08${poll.enrolled.orgId}\uFF09\uFF0C\u4E0E\u5F53\u524D\u767B\u5F55\u7EC4\u7EC7\uFF08${session.orgId}\uFF09\u4E0D\u4E00\u81F4`);
+        }
         const credential = {
           orgId: poll.enrolled.orgId || session.orgId,
           deviceId: poll.enrolled.deviceId,
@@ -2690,17 +3464,55 @@ function errorText(error) {
 }
 
 // src/protocol/sse.ts
+var DEFAULT_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+var LINE_BREAK = /\r\n|\r|\n/u;
+var RETRY_DIGITS = /^\d+$/u;
+var utf8 = new TextEncoder;
+function byteLength(text) {
+  return utf8.encode(text).length;
+}
+function findFrameBoundary(buffer) {
+  let cursor = 0;
+  for (;; ) {
+    const first = LINE_BREAK.exec(buffer.slice(cursor));
+    if (!first)
+      return null;
+    const start = cursor + first.index;
+    const afterFirst = start + first[0].length;
+    const second = LINE_BREAK.exec(buffer.slice(afterFirst));
+    if (!second)
+      return null;
+    if (second.index === 0) {
+      return { index: start, length: first[0].length + second[0].length };
+    }
+    cursor = afterFirst;
+  }
+}
+
 class SseParser {
   buffer = "";
+  bufferBytes = 0;
+  maxBufferBytes;
+  constructor(options = {}) {
+    this.maxBufferBytes = Math.max(1024, options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES);
+  }
   feed(chunk) {
     this.buffer += chunk;
+    this.bufferBytes += byteLength(chunk);
+    if (this.bufferBytes > this.maxBufferBytes) {
+      this.buffer = "";
+      this.bufferBytes = 0;
+      throw new CapyError("upstream_unavailable", `SSE \u5E27\u8D85\u8FC7 ${Math.round(this.maxBufferBytes / (1024 * 1024))} MB \u4E0A\u9650\uFF0C\u4E0A\u6E38\u53EF\u80FD\u4E0D\u662F\u4E8B\u4EF6\u6D41`);
+    }
     const frames = [];
     for (;; ) {
-      const match = /\r?\n\r?\n/u.exec(this.buffer);
-      if (!match)
+      const boundary = findFrameBoundary(this.buffer);
+      if (!boundary)
         break;
-      const raw = this.buffer.slice(0, match.index);
-      this.buffer = this.buffer.slice(match.index + match[0].length);
+      const raw = this.buffer.slice(0, boundary.index);
+      const consumed = this.buffer.slice(0, boundary.index + boundary.length);
+      this.buffer = this.buffer.slice(boundary.index + boundary.length);
+      this.bufferBytes -= byteLength(consumed);
       const frame = parseFrame(raw);
       if (frame)
         frames.push(frame);
@@ -2710,16 +3522,17 @@ class SseParser {
   end() {
     const raw = this.buffer;
     this.buffer = "";
+    this.bufferBytes = 0;
     const frame = raw.trim() ? parseFrame(raw) : null;
     return frame ? [frame] : [];
   }
 }
 function parseFrame(raw) {
   let event = "";
-  let data = "";
+  let data = null;
   let id = "";
   let retry;
-  for (const line of raw.split(/\r?\n/u)) {
+  for (const line of raw.split(LINE_BREAK)) {
     if (!line || line.startsWith(":"))
       continue;
     const colon = line.indexOf(":");
@@ -2728,21 +3541,24 @@ function parseFrame(raw) {
     if (field === "event")
       event = value;
     else if (field === "data")
-      data = data ? `${data}
-${value}` : value;
+      data = data === null ? value : `${data}
+${value}`;
     else if (field === "id")
       id = value;
     else if (field === "retry") {
-      const n = Number(value);
-      if (Number.isFinite(n) && n >= 0)
-        retry = n;
+      const text = value.trim();
+      if (RETRY_DIGITS.test(text)) {
+        const n = Number(text);
+        if (Number.isFinite(n) && n >= 0)
+          retry = n;
+      }
     }
   }
-  if (!event && !data && retry === undefined)
+  if (!event && data === null && retry === undefined)
     return null;
   return {
     event,
-    data,
+    data: data ?? "",
     ...id ? { id } : {},
     ...retry === undefined ? {} : { retry }
   };
@@ -2760,6 +3576,298 @@ async function* decodeSseStream(source) {
     yield frame;
   for (const frame of parser.end())
     yield frame;
+}
+
+// src/adapters/platform/guarded-fetch.ts
+import { lookup as dnsLookup } from "dns/promises";
+
+// src/domain/net.ts
+var BLOCKED_V4 = [
+  { base: [0, 0, 0, 0], bits: 8 },
+  { base: [10, 0, 0, 0], bits: 8 },
+  { base: [100, 64, 0, 0], bits: 10 },
+  { base: [127, 0, 0, 0], bits: 8 },
+  { base: [169, 254, 0, 0], bits: 16 },
+  { base: [172, 16, 0, 0], bits: 12 },
+  { base: [192, 0, 0, 0], bits: 24 },
+  { base: [192, 0, 2, 0], bits: 24 },
+  { base: [192, 88, 99, 0], bits: 24 },
+  { base: [192, 168, 0, 0], bits: 16 },
+  { base: [198, 18, 0, 0], bits: 15 },
+  { base: [198, 51, 100, 0], bits: 24 },
+  { base: [203, 0, 113, 0], bits: 24 },
+  { base: [224, 0, 0, 0], bits: 4 },
+  { base: [240, 0, 0, 0], bits: 4 },
+  { base: [255, 255, 255, 255], bits: 32 }
+];
+function toNumber(octets) {
+  const [a, b, c, d] = octets;
+  return a * 16777216 + b * 65536 + c * 256 + d >>> 0;
+}
+function parseIpv4(text) {
+  const value = String(text ?? "").trim();
+  if (!value)
+    return null;
+  const parts = value.split(".");
+  if (parts.length !== 4)
+    return null;
+  const octets = [];
+  for (const part of parts) {
+    if (!/^(?:0|[1-9]\d{0,2})$/u.test(part))
+      return null;
+    const n = Number(part);
+    if (n > 255)
+      return null;
+    octets.push(n);
+  }
+  return [octets[0], octets[1], octets[2], octets[3]];
+}
+function groupOf(text) {
+  return /^[0-9a-f]{1,4}$/u.test(text) ? Number.parseInt(text, 16) : null;
+}
+function parseIpv6(text) {
+  let value = String(text ?? "").trim().toLowerCase();
+  if (!value)
+    return null;
+  if (value.startsWith("[") && value.endsWith("]"))
+    value = value.slice(1, -1);
+  const zone = value.indexOf("%");
+  if (zone >= 0)
+    value = value.slice(0, zone);
+  if (!value.includes(":"))
+    return null;
+  let embeddedV4 = null;
+  const lastColon = value.lastIndexOf(":");
+  const tail = value.slice(lastColon + 1);
+  if (tail.includes(".")) {
+    embeddedV4 = parseIpv4(tail);
+    if (!embeddedV4)
+      return null;
+    const [a, b, c, d] = embeddedV4;
+    const hi = (a * 256 + b).toString(16);
+    const lo = (c * 256 + d).toString(16);
+    value = `${value.slice(0, lastColon + 1)}${hi}:${lo}`;
+  }
+  const halves = value.split("::");
+  if (halves.length > 2)
+    return null;
+  const headText = halves[0] ?? "";
+  const tailText = halves.length === 2 ? halves[1] ?? "" : "";
+  const head = headText ? headText.split(":") : [];
+  const tailGroups = halves.length === 2 && tailText ? tailText.split(":") : [];
+  if (halves.length === 1 && tailGroups.length > 0)
+    return null;
+  const headNumbers = [];
+  for (const part of head) {
+    const n = groupOf(part);
+    if (n === null)
+      return null;
+    headNumbers.push(n);
+  }
+  const tailNumbers = [];
+  for (const part of tailGroups) {
+    const n = groupOf(part);
+    if (n === null)
+      return null;
+    tailNumbers.push(n);
+  }
+  let groups;
+  if (halves.length === 1) {
+    if (headNumbers.length !== 8)
+      return null;
+    groups = headNumbers;
+  } else {
+    const missing = 8 - headNumbers.length - tailNumbers.length;
+    if (missing < 1)
+      return null;
+    groups = [...headNumbers, ...new Array(missing).fill(0), ...tailNumbers];
+  }
+  const g0 = groups[0];
+  const g1 = groups[1];
+  const g5 = groups[5];
+  const g6 = groups[6];
+  const g7 = groups[7];
+  const isV4Mapped = g0 === 0 && g1 === 0 && groups.slice(1, 5).every((g) => g === 0) && g5 === 65535;
+  const v4 = isV4Mapped ? [g6 >> 8 & 255, g6 & 255, g7 >> 8 & 255, g7 & 255] : embeddedV4;
+  return { groups, isV4Mapped, v4 };
+}
+function isBlockedIpv4(octets) {
+  if (octets.length !== 4)
+    return true;
+  const value = toNumber([octets[0], octets[1], octets[2], octets[3]]);
+  for (const range of BLOCKED_V4) {
+    const mask = range.bits >= 32 ? 4294967295 : 4294967295 << 32 - range.bits >>> 0;
+    if ((value & mask) >>> 0 === (toNumber(range.base) & mask) >>> 0)
+      return true;
+  }
+  return false;
+}
+function isBlockedIpv6(address) {
+  const groups = address.groups;
+  if (groups.length !== 8)
+    return true;
+  if (address.isV4Mapped && address.v4)
+    return isBlockedIpv4(address.v4);
+  if (groups.slice(0, 6).every((g) => g === 0))
+    return true;
+  const g0 = groups[0];
+  const g1 = groups[1];
+  if ((g0 & 65024) === 64512)
+    return true;
+  if ((g0 & 65472) === 65152)
+    return true;
+  if ((g0 & 65472) === 65216)
+    return true;
+  if ((g0 & 65280) === 65280)
+    return true;
+  if (g0 === 8193 && g1 === 3512)
+    return true;
+  if (g0 === 100 && g1 === 65435)
+    return true;
+  if (g0 === 8194)
+    return true;
+  if (g0 === 256 && groups.slice(1, 4).every((g) => g === 0))
+    return true;
+  return false;
+}
+function isBlockedIp(ip) {
+  const v4 = parseIpv4(ip);
+  if (v4)
+    return isBlockedIpv4(v4);
+  const v6 = parseIpv6(ip);
+  if (v6)
+    return isBlockedIpv6(v6);
+  return true;
+}
+function isIpLiteral(host) {
+  return parseIpv4(host) !== null || parseIpv6(host) !== null;
+}
+function isBlockedHostname(host) {
+  const value = String(host ?? "").trim().toLowerCase().replace(/^\[/u, "").replace(/\]$/u, "").replace(/\.$/u, "");
+  if (!value)
+    return true;
+  if (value === "localhost" || value.endsWith(".localhost") || value.endsWith(".local") || value.endsWith(".internal") || value.endsWith(".home.arpa") || value === "metadata") {
+    return true;
+  }
+  const v4 = parseIpv4(value);
+  if (v4)
+    return isBlockedIpv4(v4);
+  const v6 = parseIpv6(value);
+  if (v6)
+    return isBlockedIpv6(v6);
+  return false;
+}
+
+// src/adapters/platform/guarded-fetch.ts
+var DEFAULT_PORTS = [80, 443];
+var DEFAULT_TIMEOUT_MS2 = 15000;
+var DEFAULT_MAX_REDIRECTS = 3;
+var REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+function defaultLookup(hostname) {
+  return dnsLookup(hostname, { all: true, verbatim: true });
+}
+function toUrl(input) {
+  if (input instanceof URL)
+    return new URL(input.toString());
+  if (typeof input === "string")
+    return new URL(input);
+  return new URL(input.url);
+}
+function combineSignals(signal, timeoutMs) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  if (!signal)
+    return timeout;
+  const ctor = AbortSignal;
+  if (typeof ctor.any === "function")
+    return ctor.any([signal, timeout]);
+  const controller = new AbortController;
+  const abort = () => controller.abort();
+  if (signal.aborted || timeout.aborted) {
+    abort();
+    return controller.signal;
+  }
+  signal.addEventListener("abort", abort, { once: true });
+  timeout.addEventListener("abort", abort, { once: true });
+  return controller.signal;
+}
+async function cancelBody(response) {
+  try {
+    await response.body?.cancel();
+  } catch {}
+}
+function dropCredentials(init) {
+  if (!init.headers)
+    return init;
+  const headers = new Headers(init.headers);
+  headers.delete("authorization");
+  headers.delete("cookie");
+  headers.delete("proxy-authorization");
+  return { ...init, headers };
+}
+function createGuardedFetch(baseFetch, options = {}) {
+  const allowPorts = options.allowPorts ?? DEFAULT_PORTS;
+  const requireHttps = options.requireHttps === true;
+  const maxRedirects = Math.max(0, Math.trunc(options.maxRedirects ?? DEFAULT_MAX_REDIRECTS));
+  const timeoutMs = Math.max(1, Math.trunc(options.timeoutMs ?? DEFAULT_TIMEOUT_MS2));
+  const lookup = options.lookup ?? defaultLookup;
+  const blocked = (reason) => {
+    options.onBlock?.(reason);
+    return new CapyError("invalid_request", `\u76EE\u6807\u5730\u5740\u88AB\u62D2\u7EDD\uFF1A${reason}`, { detail: reason });
+  };
+  const assertAllowed = async (url) => {
+    if (url.username || url.password)
+      throw blocked("URL \u4E0D\u5141\u8BB8\u643A\u5E26 userinfo");
+    if (url.protocol !== "http:" && url.protocol !== "https:")
+      throw blocked(`\u4E0D\u652F\u6301\u7684\u534F\u8BAE ${url.protocol}`);
+    if (requireHttps && url.protocol !== "https:")
+      throw blocked("\u53EA\u5141\u8BB8 https");
+    const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+    if (!allowPorts.includes(port))
+      throw blocked(`\u7AEF\u53E3 ${port} \u4E0D\u5728\u767D\u540D\u5355`);
+    const host = url.hostname.replace(/^\[/u, "").replace(/\]$/u, "");
+    if (!host)
+      throw blocked("URL \u7F3A\u5C11\u4E3B\u673A\u540D");
+    if (isBlockedHostname(host))
+      throw blocked(`\u4E3B\u673A ${host} \u6307\u5411\u672C\u673A/\u5185\u7F51`);
+    if (isIpLiteral(host))
+      return;
+    if (options.skipDnsCheck)
+      return;
+    const addrs = await lookup(host).catch(() => null);
+    if (!addrs || addrs.length === 0)
+      throw blocked(`DNS \u65E0\u7ED3\u679C\uFF1A${host}`);
+    for (const addr of addrs) {
+      if (isBlockedIp(addr.address))
+        throw blocked(`DNS \u89E3\u6790\u5230\u5185\u7F51\u5730\u5740\uFF08${addr.address}\uFF09`);
+    }
+  };
+  const guarded = async (input, init = {}) => {
+    let current = toUrl(input);
+    let remaining = maxRedirects;
+    let currentInit = init;
+    for (;; ) {
+      await assertAllowed(current);
+      const response = await baseFetch(current.toString(), {
+        ...currentInit,
+        redirect: "manual",
+        signal: combineSignals(init.signal ?? undefined, timeoutMs)
+      });
+      if (!REDIRECT_STATUS.has(response.status))
+        return response;
+      if (remaining <= 0)
+        return response;
+      const location = response.headers.get("location");
+      if (!location)
+        return response;
+      const next = new URL(location, current);
+      await cancelBody(response);
+      if (next.host !== current.host)
+        currentInit = dropCredentials(currentInit);
+      current = next;
+      remaining -= 1;
+    }
+  };
+  return guarded;
 }
 
 // src/adapters/capy/public-client.ts
@@ -2804,11 +3912,23 @@ function modelDefault(value) {
     ...skipped.length > 0 ? { skipped } : {}
   };
 }
+var DEFAULT_SSE_IDLE_MS = 120000;
 
 class CapyPublicClient {
   fetchImpl;
-  constructor(fetchImpl = fetch) {
+  presignPut;
+  sseIdleMs;
+  constructor(fetchImpl = fetch, options = {}) {
     this.fetchImpl = fetchImpl;
+    this.presignPut = createGuardedFetch(fetchImpl, {
+      requireHttps: true,
+      allowPorts: [443],
+      maxRedirects: 0,
+      timeoutMs: 60000,
+      skipDnsCheck: true,
+      ...options.presignLookup ? { lookup: options.presignLookup } : {}
+    });
+    this.sseIdleMs = Math.max(1, options.sseIdleMs ?? DEFAULT_SSE_IDLE_MS);
   }
   async listModels(apiKey, signal) {
     const { response, body, text } = await requestJson(this.fetchImpl, `${CAPY_PUBLIC}/models`, { method: "GET", headers: publicHeaders(apiKey), ...signal ? { signal } : {} }, 20000);
@@ -2849,14 +3969,21 @@ class CapyPublicClient {
     if (!response.body)
       throw new CapyError("upstream_unavailable", "Capy \u6D41\u6CA1\u6709\u54CD\u5E94\u4F53");
     const body = response.body;
+    const idleMs = this.sseIdleMs;
     async function* chunks() {
       const reader = body.getReader();
-      for (;; ) {
-        const { done, value } = await reader.read();
-        if (done)
+      try {
+        for (;; ) {
+          const { done, value } = await readWithIdleDeadline(reader.read(), idleMs);
+          if (done)
+            return;
+          if (value)
+            yield value;
+        }
+      } finally {
+        await reader.cancel().catch(() => {
           return;
-        if (value)
-          yield value;
+        });
       }
     }
     for await (const frame of decodeSseStream(chunks())) {
@@ -2888,35 +4015,55 @@ class CapyPublicClient {
     if (!Array.isArray(targets) || targets.length !== files.length) {
       throw new CapyError("upstream_error", "Capy \u6CA1\u6709\u8FD4\u56DE\u8DB3\u591F\u7684\u6587\u4EF6\u4E0A\u4F20\u76EE\u6807");
     }
-    const out = [];
-    for (let i = 0;i < files.length; i += 1) {
-      const file = files[i];
+    const jobs = files.map((file, i) => {
       const target = targets[i];
       if (!file || !target || typeof target.fileId !== "string" || typeof target.url !== "string") {
         throw new CapyError("upstream_error", "Capy \u6587\u4EF6\u4E0A\u4F20\u76EE\u6807\u7F3A\u5C11 fileId/url");
       }
-      const put = await this.fetchImpl(target.url, {
-        method: "PUT",
-        headers: {
-          "content-type": file.mediaType,
-          "content-length": String(file.bytes.length)
-        },
-        body: file.bytes,
-        ...signal ? { signal } : {}
-      });
-      if (!put.ok) {
-        const detail = await put.text().catch(() => "");
-        throw new CapyError("upstream_error", `\u9644\u4EF6\u4E0A\u4F20\u5931\u8D25\uFF08HTTP ${put.status}\uFF09`, {
-          detail: detail.slice(0, 200)
-        });
+      return { file, target };
+    });
+    const out = new Array(jobs.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(3, jobs.length) }, async () => {
+      for (;; ) {
+        const index = next++;
+        if (index >= jobs.length)
+          return;
+        const job = jobs[index];
+        let put;
+        try {
+          put = await this.presignPut(job.target.url, {
+            method: "PUT",
+            headers: {
+              "content-type": job.file.mediaType,
+              "content-length": String(job.file.bytes.length)
+            },
+            body: job.file.bytes,
+            ...signal ? { signal } : {}
+          });
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "TimeoutError") {
+            throw new CapyError("upstream_timeout", "\u9644\u4EF6\u4E0A\u4F20\u8D85\u65F6", { cause: error });
+          }
+          if (signal?.aborted)
+            throw error;
+          throw new CapyError("upstream_unavailable", `\u9644\u4EF6\u4E0A\u4F20\u5931\u8D25\uFF1A${errorText2(error)}`, { cause: error });
+        }
+        if (!put.ok) {
+          const detail = await put.text().catch(() => "");
+          throw new CapyError("upstream_error", `\u9644\u4EF6\u4E0A\u4F20\u5931\u8D25\uFF08HTTP ${put.status}\uFF09`, {
+            detail: detail.slice(0, 200)
+          });
+        }
+        out[index] = {
+          fileId: job.target.fileId,
+          name: job.file.name,
+          mediaType: job.file.mediaType,
+          sizeBytes: job.file.bytes.length
+        };
       }
-      out.push({
-        fileId: target.fileId,
-        name: file.name,
-        mediaType: file.mediaType,
-        sizeBytes: file.bytes.length
-      });
-    }
+    });
+    await Promise.all(workers);
     return out;
   }
   async usage(apiKey, signal) {
@@ -2935,28 +4082,103 @@ class CapyPublicClient {
 function errorText2(error) {
   return error instanceof Error ? error.message : String(error);
 }
+async function readWithIdleDeadline(promise, idleMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new CapyError("upstream_timeout", `Capy \u6D41\u8D85\u8FC7 ${Math.round(idleMs / 1000)}s \u6CA1\u6709\u6570\u636E\uFF0C\u5DF2\u65AD\u5F00`)), Math.max(1, idleMs));
+      })
+    ]);
+  } finally {
+    if (timer !== undefined)
+      clearTimeout(timer);
+  }
+}
 
 // src/observability/redact.ts
 var PATTERNS = [
+  [/capydc_[A-Za-z0-9_-]{6,}/gu, "capydc_\u2026"],
   [/capyd_[A-Za-z0-9_-]{6,}/gu, "capyd_\u2026"],
   [/capy_[A-Za-z0-9_-]{6,}/gu, "capy_\u2026"],
   [/(authorization\s*[:=]\s*bearer\s+)[^\s"',}]+/giu, "$1[redacted]"],
+  [/\b(bearer\s+)[A-Za-z0-9._~+\/=-]{8,}/giu, "$1[redacted]"],
+  [/(authorization\s*[:=]\s*)(?:basic|digest|negotiate|ntlm)\s+[^\s"',}]+/giu, "$1[redacted]"],
+  [
+    /("(?:sid|sessionId|session_id|session|token|id_token|access_token|refresh_token|api_key|apikey|secret|password)"\s*:\s*)"[^"]*"/giu,
+    '$1"[redacted]"'
+  ],
   [/(cookie\s*[:=]\s*)[^"',}\n]+/giu, "$1[redacted]"],
   [/__client=[^;,\s"']+/gu, "__client=[redacted]"],
+  [/__session(?:_[A-Za-z0-9]+)?=[^;,\s"']+/gu, "__session=[redacted]"],
+  [/\bsess_[A-Za-z0-9_-]{6,}/giu, "sess_\u2026"],
+  [/\bsk-[A-Za-z0-9_-]{8,}/gu, "sk-\u2026"],
+  [/\bghp_[A-Za-z0-9]{10,}/gu, "ghp_\u2026"],
+  [/\bAIza[A-Za-z0-9_-]{10,}/gu, "AIza\u2026"],
+  [/\bgh[pousr]_[A-Za-z0-9]{10,}/gu, "gh*_\u2026"],
+  [/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]*@/giu, "$1[redacted]@"],
+  [
+    /(^|[?&;,{\[\s"])((?:sid|sessionId|session_id|session|session_token|access_token|refresh_token|id_token|token|api_key|apikey|secret|password)\s*[:=]\s*)[^&;,\s"'}#]+/giu,
+    "$1$2[redacted]"
+  ],
+  [
+    /([?&](?:X-Amz-Signature|X-Amz-Credential|X-Amz-Security-Token|Signature|AWSAccessKeyId)=)[^&\s"']+/giu,
+    "$1[redacted]"
+  ],
   [/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/gu, "[jwt]"]
 ];
+var SECRET_KEY = /(?:^|[-_.])(?:password|passphrase|secret|token|credential|credentials|authorization|cookie|session|api-?key|private-?key|signature|bearer|jwt|client-?secret)(?:$|[-_.])/u;
+var MAX_LENGTH = 512;
+function truncate(value) {
+  const text = String(value ?? "");
+  return text.length > MAX_LENGTH ? `${text.slice(0, MAX_LENGTH)}\u2026[len=${text.length}]` : text;
+}
+function isSecretKey(key) {
+  const normalized = String(key ?? "").replace(/([a-z0-9])([A-Z])/gu, "$1-$2").toLowerCase();
+  if (!normalized)
+    return false;
+  return SECRET_KEY.test(normalized);
+}
 function redact(value) {
   let text = String(value);
+  if (!text)
+    return text;
   for (const [pattern, replacement] of PATTERNS)
     text = text.replace(pattern, replacement);
   return text;
+}
+var MAX_DEPTH = 4;
+function redactValue(value, depth) {
+  if (value === null || value === undefined)
+    return value;
+  if (typeof value === "number" || typeof value === "boolean")
+    return value;
+  if (typeof value === "string")
+    return truncate(redact(value));
+  if (typeof value === "bigint")
+    return truncate(redact(value.toString()));
+  if (value instanceof Error)
+    return truncate(redact(value.message));
+  if (depth >= MAX_DEPTH)
+    return "[depth-limit]";
+  if (Array.isArray(value))
+    return value.map((item) => redactValue(item, depth + 1));
+  if (typeof value === "object") {
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      out[key] = isSecretKey(key) ? "[redacted]" : redactValue(item, depth + 1);
+    }
+    return out;
+  }
+  return truncate(redact(String(value)));
 }
 function redactFields(fields) {
   if (!fields)
     return;
   const out = {};
   for (const [key, value] of Object.entries(fields)) {
-    out[key] = typeof value === "string" ? redact(value) : value;
+    out[key] = isSecretKey(key) ? "[redacted]" : redactValue(value, 0);
   }
   return out;
 }
@@ -2988,11 +4210,15 @@ class ConsoleLogger {
 }
 
 // src/adapters/platform/memory-cache.ts
+var DEFAULT_MAX_ENTRIES = 128;
+
 class MemoryCache {
   entries = new Map;
   now;
-  constructor(now = Date.now) {
+  maxEntries;
+  constructor(now = Date.now, maxEntries = DEFAULT_MAX_ENTRIES) {
     this.now = now;
+    this.maxEntries = Number.isFinite(maxEntries) && maxEntries > 0 ? Math.floor(maxEntries) : DEFAULT_MAX_ENTRIES;
   }
   get(key) {
     const hit = this.entries.get(key);
@@ -3007,7 +4233,16 @@ class MemoryCache {
   set(key, value, ttlMs) {
     if (!Number.isFinite(ttlMs) || ttlMs <= 0)
       return;
-    this.entries.set(key, { value, expiresAt: this.now() + ttlMs });
+    const now = this.now();
+    this.sweep(now);
+    this.entries.delete(key);
+    while (this.entries.size >= this.maxEntries) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined)
+        break;
+      this.entries.delete(oldest);
+    }
+    this.entries.set(key, { value, expiresAt: now + ttlMs });
   }
   delete(key) {
     this.entries.delete(key);
@@ -3015,10 +4250,16 @@ class MemoryCache {
   clear() {
     this.entries.clear();
   }
+  sweep(now) {
+    for (const [key, entry] of this.entries) {
+      if (entry.expiresAt <= now)
+        this.entries.delete(key);
+    }
+  }
 }
 
 // src/adapters/platform/proxy-fetch.ts
-import { execFileSync as execFileSync2 } from "child_process";
+import { execFileSync } from "child_process";
 var REG_PATH = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 var PROXY_KEYS = [
   "MAGPIE_CAPY_PROXY",
@@ -3037,7 +4278,7 @@ function regQuery(name) {
     return "";
   const reg = `${process.env.SystemRoot || "C:\\Windows"}\\System32\\reg.exe`;
   try {
-    const out = execFileSync2(reg, ["query", REG_PATH, "/v", name], {
+    const out = execFileSync(reg, ["query", REG_PATH, "/v", name], {
       encoding: "utf8",
       timeout: 2500,
       windowsHide: true,
@@ -3077,6 +4318,22 @@ function normalizeProxyUrl(raw) {
     return "";
   }
 }
+function describeProxy(raw) {
+  const text = normalizeProxyUrl(raw);
+  if (!text)
+    return "configured";
+  try {
+    const url = new URL(text);
+    const scheme = url.protocol.replace(/:$/u, "") || "http";
+    const port = url.port || (scheme === "https" ? "443" : "80");
+    return `${scheme}://${url.hostname}:${port}`;
+  } catch {
+    return "configured";
+  }
+}
+function allowDirectFallback() {
+  return String(process.env.MAGPIE_CAPY_PROXY_FALLBACK ?? "").trim().toLowerCase() === "direct";
+}
 function systemProxy() {
   if (process.platform !== "win32")
     return "";
@@ -3105,9 +4362,17 @@ function hostMatchesNoProxy(host, noProxy) {
 function resolveProxyUrl(options = {}) {
   if (options.proxy === false)
     return "";
-  if (typeof options.proxy === "string" && options.proxy.trim())
-    return normalizeProxyUrl(options.proxy);
+  if (typeof options.proxy === "string") {
+    const explicit = options.proxy.trim().toLowerCase();
+    if (explicit === "off" || explicit === "false" || explicit === "none")
+      return "";
+    if (explicit)
+      return normalizeProxyUrl(options.proxy);
+  }
   const env = options.env ?? process.env;
+  const envOff = String(env.MAGPIE_CAPY_PROXY ?? "").trim().toLowerCase();
+  if (envOff === "off" || envOff === "false" || envOff === "none")
+    return "";
   for (const key of PROXY_KEYS) {
     const value = normalizeProxyUrl(env[key]);
     if (value)
@@ -3122,6 +4387,7 @@ function createProxyFetch(baseFetch, proxyUrl, options = {}) {
   const url = normalizeProxyUrl(proxyUrl);
   if (!url)
     return baseFetch;
+  const label = describeProxy(url);
   let warned = false;
   let undiciAgent = null;
   let undiciTried = false;
@@ -3140,24 +4406,20 @@ function createProxyFetch(baseFetch, proxyUrl, options = {}) {
     if (host && (LOCAL_HOSTS.has(host) || hostMatchesNoProxy(host, process.env.NO_PROXY ?? process.env.no_proxy))) {
       return baseFetch(input, init);
     }
+    const directInstead = (reason, error) => {
+      if (!allowDirectFallback())
+        throw error;
+      warn(`${reason}\uFF0C\u6309 MAGPIE_CAPY_PROXY_FALLBACK=direct \u672C\u6B21\u76F4\u8FDE`);
+      return baseFetch(input, init);
+    };
     if (typeof Bun !== "undefined") {
       const withProxy = { ...init, proxy: url };
       try {
         return await baseFetch(input, withProxy);
       } catch (error) {
-        if (proxyConnectionError(error)) {
-          warn(`\u4EE3\u7406 ${url} \u8FDE\u63A5\u5931\u8D25\uFF0C\u672C\u6B21\u76F4\u8FDE`);
-          return baseFetch(input, init);
-        }
-        try {
-          return await fetch(input, withProxy);
-        } catch (inner) {
-          if (proxyConnectionError(inner)) {
-            warn(`\u4EE3\u7406 ${url} \u8FDE\u63A5\u5931\u8D25\uFF0C\u672C\u6B21\u76F4\u8FDE`);
-            return baseFetch(input, init);
-          }
-          throw error;
-        }
+        if (proxyConnectionError(error))
+          return directInstead(`\u4EE3\u7406 ${label} \u8FDE\u63A5\u5931\u8D25`, error);
+        throw error;
       }
     }
     if (!undiciTried) {
@@ -3174,14 +4436,16 @@ function createProxyFetch(baseFetch, proxyUrl, options = {}) {
       const withDispatcher = { ...init, dispatcher: undiciAgent };
       try {
         return await baseFetch(input, withDispatcher);
-      } catch {
-        try {
-          return await baseFetch(input, { ...init, proxy: url });
-        } catch {}
+      } catch (error) {
+        if (proxyConnectionError(error))
+          return directInstead(`\u4EE3\u7406 ${label} \u8FDE\u63A5\u5931\u8D25`, error);
+        throw error;
       }
     }
-    warn(`\u68C0\u6D4B\u5230\u4EE3\u7406 ${url}\uFF0C\u4F46\u5F53\u524D Node \u8FD0\u884C\u65F6\u4E0D\u652F\u6301 fetch \u4EE3\u7406\uFF08\u672A\u5B89\u88C5 undici\uFF09\u3002` + "\u8BF7\u6539\u7528 magpie \u81EA\u5E26 Bun \u8FD0\u884C\u65F6\uFF0C\u6216\u8BBE\u7F6E NODE_OPTIONS=--use-env-proxy \u540E\u91CD\u542F\u3002");
-    return baseFetch(input, init);
+    warn(`\u68C0\u6D4B\u5230\u4EE3\u7406 ${label}\uFF0C\u4F46\u5F53\u524D Node \u8FD0\u884C\u65F6\u4E0D\u652F\u6301 fetch \u4EE3\u7406\uFF08\u672A\u5B89\u88C5 undici\uFF09\u3002` + "\u8BF7\u6539\u7528 magpie \u81EA\u5E26 Bun \u8FD0\u884C\u65F6\uFF0C\u6216\u8BBE\u7F6E NODE_OPTIONS=--use-env-proxy \u540E\u91CD\u542F\u3002");
+    if (allowDirectFallback())
+      return baseFetch(input, init);
+    throw new CapyError("upstream_unavailable", `\u5F53\u524D\u8FD0\u884C\u65F6\u4E0D\u652F\u6301 fetch \u4EE3\u7406\uFF08${label}\uFF09\uFF1A\u8BF7\u5B89\u88C5 undici\uFF0C\u6216\u8BBE\u7F6E MAGPIE_CAPY_PROXY_FALLBACK=direct \u5141\u8BB8\u76F4\u8FDE\u515C\u5E95`);
   };
 }
 
@@ -3230,11 +4494,30 @@ function isCjk(ch) {
   const code = ch.codePointAt(0) ?? 0;
   return code >= 11904 && code <= 40959 || code >= 63744 && code <= 64255 || code >= 131072 && code <= 195103 || code >= 12352 && code <= 12543 || code >= 44032 && code <= 55215;
 }
+var IMAGE_TOKENS = 85;
+var PDF_BYTES_PER_CHUNK = 1e5;
+var PDF_TOKENS_PER_CHUNK = 100;
 function estimateTokensOfMessages(messages) {
-  let text = "";
-  for (const message of messages)
-    text += messageText(message);
-  return estimateTokens(text);
+  let tokens = 0;
+  for (const message of messages) {
+    tokens += estimateTokens(messageText(message));
+    for (const part of partsOf(message)) {
+      if (isImagePart(part))
+        tokens += IMAGE_TOKENS;
+      else if (isFilePart(part))
+        tokens += pdfTokens(part);
+    }
+  }
+  return tokens;
+}
+function partsOf(message) {
+  return typeof message.content === "string" ? [] : message.content;
+}
+function isImagePart(part) {
+  return part.type === "image_url" || part.type === "input_image" || part.type === "image";
+}
+function isFilePart(part) {
+  return part.type === "file" || part.type === "input_file";
 }
 function messageText(message) {
   const content = message.content;
@@ -3245,12 +4528,6 @@ function messageText(message) {
     for (const part of content) {
       if (part.type === "text" || part.type === "input_text" || part.type === "output_text") {
         text += part.text;
-      } else if (part.type === "image_url" || part.type === "input_image" || part.type === "image") {
-        const name = "name" in part && typeof part.name === "string" ? part.name : "image";
-        text += `[\u56FE\u7247: ${name}]`;
-      } else {
-        const name = "name" in part && typeof part.name === "string" ? part.name : "file";
-        text += `[\u9644\u4EF6: ${name}]`;
       }
     }
   }
@@ -3258,11 +4535,27 @@ function messageText(message) {
     text += `${call.name}${call.arguments}`;
   return text;
 }
+function pdfTokens(part) {
+  const mediaType = String(part.mediaType ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+  if (mediaType !== "application/pdf")
+    return 0;
+  const data = typeof part.data === "string" ? part.data : "";
+  if (!data)
+    return 0;
+  const payload = data.startsWith("data:") ? data.split(",", 2)[1] ?? "" : data;
+  const compact = payload.replace(/\s/gu, "");
+  if (!compact)
+    return 0;
+  const bytes = Math.floor(compact.length * 3 / 4);
+  if (bytes <= 0)
+    return 0;
+  return Math.ceil(bytes / PDF_BYTES_PER_CHUNK) * PDF_TOKENS_PER_CHUNK;
+}
 
 // src/adapters/platform/ulid.ts
-import { randomBytes, randomUUID as randomUUID2 } from "crypto";
+import { randomBytes as randomBytes2, randomUUID as randomUUID2 } from "crypto";
 var ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-function ulid(now = Date.now(), random = randomBytes(10)) {
+function ulid(now = Date.now(), random = randomBytes2(10)) {
   let time = Math.max(0, Number(now) || 0);
   const timeChars = new Array(10);
   for (let i = 9;i >= 0; i -= 1) {
@@ -3290,6 +4583,25 @@ class SystemIds {
 }
 
 // src/adapters/host/magpie-auth.ts
+import { createHash as createHash2 } from "crypto";
+var LOGIN_SOURCES = ["local", "browser", "cookie", "refresh"];
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    if (typeof value !== "string")
+      continue;
+    const trimmed = value.trim();
+    if (trimmed)
+      return trimmed;
+  }
+  return "";
+}
+function sourceOf(metadata) {
+  const raw = typeof metadata.source === "string" ? metadata.source.trim().toLowerCase() : "";
+  return LOGIN_SOURCES.includes(raw) ? raw : "refresh";
+}
+function shortHash(value) {
+  return createHash2("sha256").update(value).digest("hex").slice(0, 8);
+}
 function parseRefresh(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     const record = value;
@@ -3323,23 +4635,25 @@ function sessionOfAuth(auth) {
   if (!refresh)
     throw new CapyError("sign_in_required", "Capy \u767B\u5F55\u6001\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55");
   const metadata = record.metadata && typeof record.metadata === "object" && !Array.isArray(record.metadata) ? record.metadata : {};
-  const orgId = refresh.orgId ?? (typeof metadata.orgId === "string" ? metadata.orgId : "");
+  const orgId = firstNonEmpty(refresh.orgId, metadata.orgId);
   if (!orgId)
     throw new CapyError("sign_in_required", "Capy \u767B\u5F55\u6001\u7F3A\u5C11\u7EC4\u7EC7\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55");
-  const uid = refresh.userId ?? (typeof metadata.userId === "string" ? metadata.userId : "") ?? (typeof record.uid === "string" ? record.uid : "");
-  const accountId = typeof record.accountId === "string" && record.accountId ? record.accountId : uid || access.slice(-8);
+  const uid = firstNonEmpty(refresh.userId, metadata.userId, record.uid);
+  const accountId = firstNonEmpty(record.accountId) || uid || shortHash(access);
+  const apiKeyId = typeof metadata.keyId === "string" ? metadata.keyId : "";
   return {
     accountId,
     uid,
     orgId,
-    clientId: refresh.clientId ?? (typeof metadata.clientId === "string" ? metadata.clientId : ""),
+    clientId: firstNonEmpty(refresh.clientId, metadata.clientId),
     accessToken: access,
     clerk: { clientJwt: refresh.clientJwt, sessionId: refresh.sessionId },
-    source: "refresh",
-    ...typeof metadata.name === "string" && metadata.name ? { displayName: metadata.name } : {}
+    source: sourceOf(metadata),
+    ...typeof metadata.name === "string" && metadata.name ? { displayName: metadata.name } : {},
+    ...apiKeyId ? { apiKeyId } : {}
   };
 }
-function authRecordOf(session) {
+function authRecordOf(session, options = {}) {
   return {
     type: "success",
     access: session.accessToken,
@@ -3351,7 +4665,7 @@ function authRecordOf(session) {
       userId: session.uid,
       clientId: session.clientId
     }),
-    expires: Date.now() + 7 * 24 * 3600000,
+    expires: options.expires ?? Date.now() + 7 * 24 * 3600000,
     accountId: session.accountId,
     uid: session.uid,
     metadata: {
@@ -3359,16 +4673,20 @@ function authRecordOf(session) {
       userId: session.uid,
       orgId: session.orgId,
       clientId: session.clientId,
-      source: session.source
+      source: session.source,
+      ...session.apiKeyId ? { keyId: session.apiKeyId } : {}
     }
   };
 }
 
 // src/application/attachments.ts
-var MAX_ATTACHMENT_BYTES = 262144000;
+var ATTACHMENT_LIMITS = {
+  maxFiles: 32,
+  maxTotalBytes: 128 * 1024 * 1024,
+  maxFileBytes: 262144000
+};
 var DATA_URL = /^data:([^;,]+)?(;base64)?,([\s\S]*)$/u;
 var BARE_BASE64 = /^[A-Za-z0-9+/]+={0,2}$/u;
-var PRIVATE_HOST = /^(?:localhost|0\.0\.0\.0|127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.|::1$|\[::1\]$|\[::\]$|fe80:|fc[0-9a-f]{2}:|fd[0-9a-f]{2}:|.*\.local$)/iu;
 function mediaTypeOf(value, fallback = "application/octet-stream") {
   const text = String(value ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
   return /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/u.test(text) ? text : fallback;
@@ -3376,21 +4694,49 @@ function mediaTypeOf(value, fallback = "application/octet-stream") {
 function safeName(name, mediaType, index) {
   const base = String(name ?? "").split(/[\\/]/u).pop()?.replace(/[\u0000-\u001f<>:"|?*]/gu, "").trim();
   if (base)
-    return base.slice(0, 200);
+    return Array.from(base).slice(0, 200).join("");
   const ext = mediaType.split("/")[1]?.replace(/[^a-z0-9]/giu, "") || "bin";
   return `attachment-${index + 1}.${ext}`;
 }
-function assertSize(bytes, name) {
-  if (bytes.length > MAX_ATTACHMENT_BYTES) {
-    throw new CapyError("invalid_request", `\u9644\u4EF6 ${name} \u8D85\u8FC7 250 MB\uFF08\u5355\u6587\u4EF6\u4E0A\u9650\uFF09`);
+function limitsOf(partial) {
+  if (!partial)
+    return ATTACHMENT_LIMITS;
+  return {
+    maxFiles: partial.maxFiles ?? ATTACHMENT_LIMITS.maxFiles,
+    maxTotalBytes: partial.maxTotalBytes ?? ATTACHMENT_LIMITS.maxTotalBytes,
+    maxFileBytes: partial.maxFileBytes ?? ATTACHMENT_LIMITS.maxFileBytes
+  };
+}
+function assertSize(bytes, name, limits) {
+  if (bytes.length > limits.maxFileBytes) {
+    throw new CapyError("invalid_request", `\u9644\u4EF6 ${name} \u8D85\u8FC7\u5355\u6587\u4EF6\u4E0A\u9650\uFF08250 MB\uFF09`);
   }
 }
-function decodeDataUrl(value, fallbackType) {
+function decodeDataUrl(value, fallbackType, limits) {
   const match = DATA_URL.exec(value);
   if (!match)
     return null;
   const mediaType = mediaTypeOf(match[1], fallbackType);
-  const bytes = match[2] ? Buffer.from(match[3] ?? "", "base64") : Buffer.from(decodeURIComponent(match[3] ?? ""), "utf8");
+  const raw = match[3] ?? "";
+  let bytes;
+  if (match[2]) {
+    if (!/^[A-Za-z0-9+/]*={0,2}$/u.test(raw) || raw.length % 4 !== 0) {
+      throw new CapyError("invalid_request", "\u9644\u4EF6 data URL \u7684 base64 \u8F7D\u8377\u65E0\u6548");
+    }
+    bytes = Buffer.from(raw, "base64");
+  } else {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(raw);
+    } catch {
+      throw new CapyError("invalid_request", "\u9644\u4EF6 data URL \u7684\u767E\u5206\u53F7\u8F6C\u4E49\u65E0\u6548");
+    }
+    bytes = Buffer.from(decoded, "utf8");
+  }
+  if (bytes.length === 0) {
+    throw new CapyError("invalid_request", "\u9644\u4EF6 data URL \u4E3A\u7A7A\uFF080 \u5B57\u8282\uFF09");
+  }
+  assertSize(bytes, "data URL", limits);
   return { mediaType, bytes };
 }
 function assertPublicUrl(raw) {
@@ -3403,38 +4749,87 @@ function assertPublicUrl(raw) {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new CapyError("invalid_request", "\u9644\u4EF6\u53EA\u652F\u6301 http/https URL \u6216 data URL");
   }
-  if (PRIVATE_HOST.test(url.hostname)) {
+  if (url.username || url.password) {
+    throw new CapyError("invalid_request", "\u9644\u4EF6 URL \u4E0D\u5141\u8BB8\u643A\u5E26\u7528\u6237\u540D/\u5BC6\u7801");
+  }
+  if (isBlockedHostname(url.hostname)) {
     throw new CapyError("invalid_request", "\u9644\u4EF6 URL \u6307\u5411\u672C\u673A/\u5185\u7F51\u5730\u5740\uFF0C\u5DF2\u62D2\u7EDD\uFF08SSRF\uFF09");
   }
   return url;
 }
-async function readRemote(fetchImpl, raw, name, signal) {
+async function readCapped(response, name, limits, signal) {
+  if (!response.body)
+    return new Uint8Array(0);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;; ) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      if (!value || value.length === 0)
+        continue;
+      total += value.length;
+      if (total > limits.maxFileBytes) {
+        await reader.cancel().catch(() => {
+          return;
+        });
+        throw new CapyError("invalid_request", `\u9644\u4EF6 ${name} \u8D85\u8FC7\u5355\u6587\u4EF6\u4E0A\u9650\uFF08250 MB\uFF09`);
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    if (error instanceof CapyError)
+      throw error;
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      throw new CapyError("upstream_timeout", "\u4E0B\u8F7D\u8FDC\u7A0B\u9644\u4EF6\u8D85\u65F6", { cause: error });
+    }
+    if (signal?.aborted) {
+      throw new CapyError("upstream_unavailable", "\u4E0B\u8F7D\u8FDC\u7A0B\u9644\u4EF6\u5DF2\u53D6\u6D88", { cause: error });
+    }
+    throw new CapyError("upstream_unavailable", `\u4E0B\u8F7D\u8FDC\u7A0B\u9644\u4EF6\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+async function readRemote(fetchImpl, raw, name, signal, limits) {
   const url = assertPublicUrl(raw);
   let response;
   try {
     response = await fetchImpl(url.toString(), {
       method: "GET",
       headers: { accept: "image/*,application/pdf,*/*;q=0.8" },
-      redirect: "follow",
       ...signal ? { signal } : {}
     });
   } catch (error) {
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      throw new CapyError("upstream_timeout", "\u4E0B\u8F7D\u8FDC\u7A0B\u9644\u4EF6\u8D85\u65F6", { cause: error });
+    }
     throw new CapyError("upstream_unavailable", `\u4E0B\u8F7D\u8FDC\u7A0B\u9644\u4EF6\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`, { cause: error });
   }
   if (!response.ok)
     throw new CapyError("invalid_request", `\u4E0B\u8F7D\u8FDC\u7A0B\u9644\u4EF6\u5931\u8D25\uFF08HTTP ${response.status}\uFF09`);
-  const length = Number(response.headers.get("content-length") ?? 0);
-  if (length > MAX_ATTACHMENT_BYTES)
-    throw new CapyError("invalid_request", "\u8FDC\u7A0B\u9644\u4EF6\u8D85\u8FC7 250 MB");
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  assertSize(bytes, name);
+  const declared = Number(response.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > limits.maxFileBytes) {
+    await response.body?.cancel().catch(() => {
+      return;
+    });
+    throw new CapyError("invalid_request", "\u8FDC\u7A0B\u9644\u4EF6\u8D85\u8FC7\u5355\u6587\u4EF6\u4E0A\u9650\uFF08250 MB\uFF09");
+  }
+  const bytes = await readCapped(response, name, limits, signal);
   return {
     name: safeName(name || url.pathname.split("/").pop(), mediaTypeOf(response.headers.get("content-type")), 0),
     mediaType: mediaTypeOf(response.headers.get("content-type")),
     bytes
   };
 }
-async function resolvePart(fetchImpl, part, index, signal) {
+async function resolvePart(fetchImpl, part, index, signal, limits) {
   const fallbackType = part.type === "image_url" || part.type === "input_image" || part.type === "image" ? "image/png" : part.mediaType ?? "application/octet-stream";
   const isImagePart = part.type === "image_url" || part.type === "input_image" || part.type === "image";
   const source = isImagePart ? part.url : ("data" in part) && typeof part.data === "string" ? part.data : part.url ?? "";
@@ -3442,26 +4837,28 @@ async function resolvePart(fetchImpl, part, index, signal) {
   if (!source)
     throw new CapyError("invalid_request", "\u9644\u4EF6\u7F3A\u5C11\u5185\u5BB9\uFF08data URL / http(s) URL / base64\uFF09");
   if (source.startsWith("data:")) {
-    const decoded = decodeDataUrl(source, fallbackType);
+    const decoded = decodeDataUrl(source, fallbackType, limits);
     if (!decoded)
       throw new CapyError("invalid_request", "\u9644\u4EF6 data URL \u65E0\u6CD5\u89E3\u6790");
-    assertSize(decoded.bytes, name);
     return { name, mediaType: decoded.mediaType, bytes: decoded.bytes };
   }
   if (/^https?:\/\//iu.test(source)) {
-    return readRemote(fetchImpl, source, name, signal);
+    return readRemote(fetchImpl, source, name, signal, limits);
   }
   const text = source.trim();
   if (BARE_BASE64.test(text) && text.length % 4 === 0) {
     const bytes = Buffer.from(text, "base64");
-    assertSize(bytes, name);
+    assertSize(bytes, name, limits);
     return { name, mediaType: fallbackType, bytes };
   }
   throw new CapyError("invalid_request", "\u9644\u4EF6\u5185\u5BB9\u4E0D\u662F data URL / http(s) URL / base64");
 }
 async function collectAttachments(messages, options) {
+  const limits = limitsOf(options.limits);
+  const directFetch = options.directFetch ?? options.fetchImpl;
   const cleaned = [];
   const attachments = [];
+  let totalBytes = 0;
   for (const message of messages) {
     if (typeof message.content === "string") {
       cleaned.push(message);
@@ -3474,7 +4871,14 @@ async function collectAttachments(messages, options) {
         continue;
       }
       if (part.type === "image_url" || part.type === "input_image" || part.type === "image" || part.type === "file" || part.type === "input_file") {
-        const attachment = await resolvePart(options.fetchImpl, part, attachments.length, options.signal);
+        if (attachments.length >= limits.maxFiles) {
+          throw new CapyError("invalid_request", `\u9644\u4EF6\u6570\u91CF\u8D85\u8FC7\u4E0A\u9650\uFF08\u6700\u591A ${limits.maxFiles} \u4E2A\uFF09`);
+        }
+        const attachment = await resolvePart(directFetch, part, attachments.length, options.signal, limits);
+        totalBytes += attachment.bytes.length;
+        if (totalBytes > limits.maxTotalBytes) {
+          throw new CapyError("invalid_request", "\u9644\u4EF6\u603B\u5927\u5C0F\u8D85\u8FC7\u4E0A\u9650\uFF08128 MiB\uFF09");
+        }
         attachments.push(attachment);
         const image = /^image\//u.test(attachment.mediaType);
         parts.push({
@@ -3508,6 +4912,9 @@ class DeviceUseCase {
     } finally {
       this.inflight.delete(key);
     }
+  }
+  peek(session) {
+    return this.runtime.peek(session);
   }
   close() {
     this.inflight.clear();
@@ -3596,9 +5003,11 @@ function resolveModelId(requested, models) {
   if (byId)
     return byId.id;
   const short = target.split("/").pop() ?? target;
-  const byShort = models.find((model) => (model.id.split("/").pop() ?? model.id) === short);
-  if (byShort)
-    return byShort.id;
+  const byShort = models.filter((model) => (model.id.split("/").pop() ?? model.id) === short);
+  if (byShort.length === 1)
+    return byShort[0]?.id ?? "";
+  if (byShort.length > 1)
+    throw ambiguousModel(wanted, byShort);
   const normalize = (value) => value.toLowerCase().replace(/[\s._-]+/gu, "");
   const norm = normalize(target);
   const byName = models.find((model) => normalize(model.name) === norm || normalize(model.id) === norm);
@@ -3606,11 +5015,29 @@ function resolveModelId(requested, models) {
     return byName.id;
   throw new CapyError("model_not_found", `Capy \u4E0D\u8BA4\u8BC6\u6A21\u578B "${wanted}"`, { detail: wanted });
 }
+function ambiguousModel(wanted, candidates) {
+  const ids = candidates.map((model) => model.id);
+  return new CapyError("model_not_found", `\u6A21\u578B "${wanted}" \u6709\u591A\u4E2A\u5019\u9009\uFF1A${ids.join("\u3001")}\uFF0C\u8BF7\u7528\u5B8C\u6574\u6A21\u578B id`, { detail: ids.join(",") });
+}
 function reasoningModeOf(request, model) {
   const raw = String(request.reasoningEffort ?? "").trim().toLowerCase();
   if (!raw || !model)
     return "";
   return model.reasoningModes.includes(raw) ? raw : "";
+}
+
+// src/application/key-hash.ts
+async function keyHash(value) {
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle) {
+    const digest = await subtle.digest("SHA-256", new TextEncoder().encode(value));
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+  let hash = 5381;
+  for (let i = 0;i < value.length; i += 1) {
+    hash = (hash << 5) + hash + (value.charCodeAt(i) ?? 0) >>> 0;
+  }
+  return `djb2-${hash.toString(16)}`;
 }
 
 // src/application/catalog.ts
@@ -3622,7 +5049,7 @@ class CatalogUseCase {
     this.options = options;
   }
   async load(apiKey, signal) {
-    const cacheKey = `catalog:${apiKey.slice(-16)}`;
+    const cacheKey = `catalog:${await keyHash(apiKey)}`;
     const hit = this.options.cache?.get(cacheKey);
     if (hit)
       return hit;
@@ -3654,6 +5081,7 @@ class CatalogUseCase {
 }
 
 // src/domain/chat.ts
+var PROMPT_CHAR_LIMIT = 1e6;
 function textOfContent(content) {
   if (typeof content === "string")
     return content;
@@ -3671,6 +5099,7 @@ function textOfContent(content) {
   return parts.join(`
 `);
 }
+var SAFE_TOOL_NAME = /^[A-Za-z0-9_.:-]{1,64}$/u;
 function buildPrompt(messages, options = {}) {
   if (messages.length === 0)
     throw promptError("messages \u4E3A\u7A7A");
@@ -3689,63 +5118,78 @@ function buildPrompt(messages, options = {}) {
       continue;
     }
     if (message.role === "assistant") {
-      const tools = (message.toolCalls ?? []).map((call) => call.name).filter(Boolean);
-      const suffix = tools.length > 0 ? ` [\u8C03\u7528\u5DE5\u5177: ${tools.join(", ")}]` : "";
-      if (text || suffix)
-        turns.push({ role: "assistant", text: `${text}${suffix}`.trim() });
+      const calls = (message.toolCalls ?? []).filter((call) => SAFE_TOOL_NAME.test(call.name));
+      const suffix = calls.length > 0 ? ` [\u8C03\u7528\u5DE5\u5177: ${calls.map((call) => call.name).join(", ")}]` : "";
+      if (text || suffix) {
+        turns.push({
+          role: "assistant",
+          text: `${text}${suffix}`.trim(),
+          ...calls.length > 0 ? { toolCalls: calls } : {}
+        });
+      }
       continue;
     }
     if (message.role === "tool") {
-      const name = message.name ?? message.toolCallId ?? "tool";
-      turns.push({ role: "tool", name, text: text || "(\u65E0\u8F93\u51FA)" });
+      turns.push({
+        role: "tool",
+        name: message.name ?? "tool",
+        ...message.toolCallId ? { toolCallId: message.toolCallId } : {},
+        text: text || "(\u65E0\u8F93\u51FA)"
+      });
     }
   }
   if (turns.length === 0)
     throw promptError("messages \u91CC\u6CA1\u6709 user/assistant \u5185\u5BB9");
   const toolInstruction = options.toolInstruction ?? "";
-  if (turns.length === 1 && turns[0]?.role === "user") {
-    const only = turns[0].text;
-    let text = systems.length > 0 ? `<system>
-${systems.join(`
-
-`)}
-</system>
-
-<user>
-${only}
-</user>` : only;
-    if (toolInstruction.length > 0)
-      text += `
-
-${toolInstruction}`;
-    return text;
+  const trimmedInstruction = toolInstruction.trim();
+  if (turns.length === 1 && turns[0]?.role === "user" && systems.length === 0 && !trimmedInstruction) {
+    if (turns[0].text.length > PROMPT_CHAR_LIMIT) {
+      throw promptError(`\u63D0\u793A\u8BCD\u8D85\u8FC7 ${PROMPT_CHAR_LIMIT} \u5B57\u7B26\u4E0A\u9650\uFF0C\u8BF7\u7F29\u77ED\u5BF9\u8BDD\u5386\u53F2\u540E\u91CD\u8BD5`);
+    }
+    return turns[0].text;
   }
+  const nonce = String(options.nonce ?? "").trim();
+  if (!nonce)
+    throw promptError("\u7F3A\u5C11 prompt nonce");
+  const tag = (label) => `<<<CAPY:${nonce}:${label}>>>`;
   const blocks = [];
-  if (systems.length > 0)
-    blocks.push(`<system>
-${systems.join(`
+  if (systems.length > 0) {
+    blocks.push(`${tag("SYSTEM")}
+${escapeForPrompt(systems.join(`
 
-`)}
-</system>`);
-  blocks.push("<conversation>");
-  for (const turn of turns) {
-    if (turn.role === "tool")
-      blocks.push(`<tool name="${turn.name ?? "tool"}">
-${turn.text}
-</tool>`);
-    else
-      blocks.push(`<${turn.role}>
-${turn.text}
-</${turn.role}>`);
+`))}`);
   }
-  blocks.push("</conversation>");
+  blocks.push(tag("CONVERSATION"));
+  for (const turn of turns) {
+    if (turn.role === "tool") {
+      const name = SAFE_TOOL_NAME.test(turn.name ?? "") ? String(turn.name) : "tool";
+      const callId = turn.toolCallId && SAFE_TOOL_NAME.test(turn.toolCallId) ? ` call_id=${turn.toolCallId}` : "";
+      blocks.push(`${tag(`TOOL name=${name}${callId}`)}
+${escapeForPrompt(turn.text)}`);
+      continue;
+    }
+    blocks.push(`${tag(turn.role === "assistant" ? "ASSISTANT" : "USER")}
+${escapeForPrompt(turn.text)}`);
+    if (turn.role === "assistant" && turn.toolCalls && turn.toolCalls.length > 0) {
+      blocks.push(`${tag("TOOL-CALLS")}
+${escapeForPrompt(JSON.stringify(turn.toolCalls.map((call) => ({ id: call.id, name: call.name, arguments: call.arguments }))))}`);
+    }
+  }
+  blocks.push(tag("END-CONVERSATION"));
   const last = turns[turns.length - 1];
   blocks.push(last?.role === "assistant" ? "Continue the last assistant message." : "Reply to the last user message.");
-  if (toolInstruction.length > 0)
-    blocks.push(toolInstruction);
-  return blocks.join(`
+  if (trimmedInstruction)
+    blocks.push(escapeForPrompt(toolInstruction));
+  const prompt = blocks.join(`
 
 `);
+  if (prompt.length > PROMPT_CHAR_LIMIT) {
+    throw promptError(`\u63D0\u793A\u8BCD\u8D85\u8FC7 ${PROMPT_CHAR_LIMIT} \u5B57\u7B26\u4E0A\u9650\uFF0C\u8BF7\u7F29\u77ED\u5BF9\u8BDD\u5386\u53F2\u540E\u91CD\u8BD5`);
+  }
+  return prompt;
+}
+function escapeForPrompt(text) {
+  return text.replaceAll("<<<CAPY:", "<<<CAPY-ESCAPED:");
 }
 function promptError(message) {
   return new CapyError("invalid_request", message);
@@ -3756,9 +5200,14 @@ class PublicSseNormalizer {
   partial = new Map;
   finalText = "";
   lastText = "";
+  lastCallId = "";
   sawDelta = false;
+  sawDone = false;
+  sawRunEnd = false;
+  dropped = false;
   errored = false;
   finished = false;
+  finishEmitted = false;
   push(frame) {
     if (this.errored || this.finished)
       return [];
@@ -3769,7 +5218,14 @@ class PublicSseNormalizer {
         return this.onTranscript(parseJson(frame.data));
       case "error":
         return this.onError(parseJson(frame.data));
+      case "turn":
+        this.onTurn(parseJson(frame.data));
+        return [];
+      case "run":
+        this.onRun(parseJson(frame.data));
+        return [];
       case "done":
+        this.sawDone = true;
         this.finished = true;
         return [];
       default:
@@ -3777,18 +5233,29 @@ class PublicSseNormalizer {
     }
   }
   finish() {
-    if (this.errored)
+    if (this.errored || this.finishEmitted)
       return [];
+    this.finishEmitted = true;
+    if (!this.completed) {
+      this.finished = true;
+      return [{
+        type: "error",
+        error: new CapyError("upstream_unavailable", "\u4E0A\u6E38\u6D41\u5728\u5B8C\u6210\u524D\u4E2D\u65AD")
+      }];
+    }
     const events = [];
-    const text = this.finalText || this.lastText;
+    const text = this.dropped ? "" : this.finalText || this.lastText;
     if (text)
       events.push({ type: "final", text });
     events.push({ type: "done" });
     this.finished = true;
     return events;
   }
+  get completed() {
+    return this.sawDone || this.sawRunEnd;
+  }
   get text() {
-    return this.finalText || this.lastText;
+    return this.dropped ? "" : this.finalText || this.lastText;
   }
   get hasError() {
     return this.errored;
@@ -3800,12 +5267,23 @@ class PublicSseNormalizer {
     const piece = typeof payload.text === "string" ? payload.text : "";
     if (!callId || !piece)
       return [];
+    if (this.lastCallId && callId !== this.lastCallId) {
+      this.finalText = "";
+    }
+    this.lastCallId = callId;
     const previous = this.partial.get(callId) ?? "";
+    if (piece.length < previous.length && previous.startsWith(piece)) {
+      this.partial.set(callId, piece);
+      this.lastText = piece;
+      this.dropped = false;
+      return [];
+    }
     const grows = piece.startsWith(previous);
     const next = grows ? piece : previous + piece;
     const delta = grows ? piece.slice(previous.length) : piece;
     this.partial.set(callId, next);
     this.lastText = next;
+    this.dropped = false;
     if (!delta)
       return [];
     this.sawDelta = true;
@@ -3817,9 +5295,15 @@ class PublicSseNormalizer {
     const text = typeof payload.text === "string" ? payload.text : "";
     if (!text)
       return [];
+    const callId = typeof payload.callId === "string" ? payload.callId : "";
+    if (callId && this.lastCallId && callId !== this.lastCallId)
+      return [];
+    if (callId)
+      this.lastCallId = callId;
     const previous = this.lastText;
     this.finalText = text;
     this.lastText = text;
+    this.dropped = false;
     if (!this.sawDelta) {
       this.sawDelta = true;
       return [{ type: "delta", text }];
@@ -3828,6 +5312,20 @@ class PublicSseNormalizer {
       return [{ type: "delta", text: text.slice(previous.length) }];
     }
     return [];
+  }
+  onTurn(payload) {
+    if (payload?.phase !== "end" || payload.outcome !== "dropped")
+      return;
+    this.partial.clear();
+    this.finalText = "";
+    this.lastText = "";
+    this.lastCallId = "";
+    this.sawDelta = false;
+    this.dropped = true;
+  }
+  onRun(payload) {
+    if (payload?.phase === "end")
+      this.sawRunEnd = true;
   }
   onError(payload) {
     const code = typeof payload?.code === "string" ? payload.code : "";
@@ -3864,22 +5362,21 @@ function parseJson(value) {
 
 // src/application/chat.ts
 var JWT_TTL_MS = 50000;
-var PACE_THRESHOLD = 200;
-var PACE_CHUNK = 40;
-var PACE_DELAY_MS = 50;
-var PACE_MAX_MS = 2000;
+var MAX_JWT_ENTRIES = 128;
 
 class ChatUseCase {
   options;
   jwtCache = new Map;
+  jwtInflight = new Map;
   constructor(options) {
     this.options = options;
   }
   async* stream(session, request, run = {}) {
     const device = await this.options.device.ensure(session, run.signal);
     const toolInstruction = this.options.toolsEnabled ? this.options.tools.instruction(request.tools ?? [], request.toolChoice) : "";
-    const prompt = buildPrompt(request.messages, { toolInstruction });
+    const prompt = buildPrompt(request.messages, { toolInstruction, nonce: this.options.ids.uuid() });
     const jwt = await this.sessionJwt(session, run.signal);
+    const modelId = run.modelId ?? request.model;
     const create = async (promptVariant) => {
       const requestId = this.options.ids.ulid();
       return await this.options.app.createJam(jwt, session.orgId, {
@@ -3887,12 +5384,12 @@ class ChatUseCase {
         requestId,
         clientKey: requestId,
         message: prompt,
-        modelId: request.model,
+        modelId,
         deviceId: device.id,
         ...run.reasoningMode ? { reasoningMode: run.reasoningMode } : {},
         ...run.files && run.files.length > 0 ? { files: run.files } : {},
         ...promptVariant ? { promptVariant } : {},
-        ...isAdsModel(request.model) ? { ads: true } : {}
+        ...isAdsModel(modelId) ? { ads: true } : {}
       }, run.signal);
     };
     let thread;
@@ -3915,15 +5412,13 @@ class ChatUseCase {
     if (blocked)
       throw blocked;
     const normalizer = new PublicSseNormalizer;
+    let completedNormally = false;
     try {
       for await (const frame of this.options.publicApi.streamThread(session.accessToken, thread.id, run.signal)) {
-        for (const event of normalizer.push(frame)) {
-          if (event.type === "delta") {
-            yield* this.paceDelta(event.text, run.signal);
-          } else {
-            yield event;
-          }
-        }
+        for (const event of normalizer.push(frame))
+          yield event;
+        if (normalizer.completed)
+          break;
       }
       if (!normalizer.text && !normalizer.hasError) {
         const failure = await this.jamFailure(jwt, session.orgId, thread.id, run.signal);
@@ -3932,8 +5427,11 @@ class ChatUseCase {
           return;
         }
       }
-      for (const event of normalizer.finish())
+      const finishEvents = normalizer.finish();
+      for (const event of finishEvents)
         yield event;
+      if (finishEvents.some((event) => event.type === "done"))
+        completedNormally = true;
     } catch (error) {
       if (error instanceof CapyError) {
         yield { type: "error", error };
@@ -3945,6 +5443,12 @@ class ChatUseCase {
         type: "error",
         error: new CapyError("upstream_unavailable", errorMessage(error), { cause: error })
       };
+    } finally {
+      if (!completedNormally) {
+        try {
+          await this.options.app.interruptJam(jwt, session.orgId, thread.id, run.signal);
+        } catch {}
+      }
     }
   }
   async jamFailure(jwt, orgId, jamId, signal) {
@@ -3970,37 +5474,36 @@ class ChatUseCase {
       await this.options.app.interruptJam(jwt, session.orgId, jamId);
     } catch {}
   }
-  async* paceDelta(text, signal) {
-    const points = Array.from(text);
-    if (points.length <= PACE_THRESHOLD) {
-      yield { type: "delta", text };
-      return;
-    }
-    const pieces = [];
-    for (let i = 0;i < points.length; i += PACE_CHUNK) {
-      pieces.push(points.slice(i, i + PACE_CHUNK).join(""));
-    }
-    let delay = PACE_DELAY_MS;
-    const total = (pieces.length - 1) * delay;
-    if (total > PACE_MAX_MS) {
-      delay = Math.floor(PACE_MAX_MS / (pieces.length - 1));
-    }
-    for (let i = 0;i < pieces.length; i++) {
-      if (i > 0 && delay > 0) {
-        await this.options.clock.sleep(delay, signal);
-      }
-      yield { type: "delta", text: pieces[i] };
-    }
-  }
   async sessionJwt(session, signal) {
     const key = `${accountKey(session)}:${session.clerk.sessionId}`;
     const hit = this.jwtCache.get(key);
     const now = this.options.clock.now();
-    if (hit && hit.expiresAt > now)
-      return hit.jwt;
-    const jwt = await this.options.app.sessionJwt(session.clerk, signal);
-    this.jwtCache.set(key, { jwt, expiresAt: now + JWT_TTL_MS });
-    return jwt;
+    if (hit) {
+      if (hit.expiresAt > now)
+        return hit.jwt;
+      this.jwtCache.delete(key);
+    }
+    const inflight = this.jwtInflight.get(key);
+    if (inflight)
+      return await inflight;
+    const task = (async () => {
+      const jwt = await this.options.app.sessionJwt(session.clerk, signal);
+      while (this.jwtCache.size >= MAX_JWT_ENTRIES) {
+        const oldest = this.jwtCache.keys().next().value;
+        if (oldest === undefined)
+          break;
+        this.jwtCache.delete(oldest);
+      }
+      this.jwtCache.set(key, { jwt, expiresAt: this.options.clock.now() + JWT_TTL_MS });
+      return jwt;
+    })();
+    this.jwtInflight.set(key, task);
+    try {
+      return await task;
+    } finally {
+      if (this.jwtInflight.get(key) === task)
+        this.jwtInflight.delete(key);
+    }
   }
 }
 function askError(detail) {
@@ -4037,6 +5540,21 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+// src/application/minimal-gate.ts
+class MinimalVariantGate {
+  disabledByDefault;
+  unsupported = new Map;
+  constructor(disabledByDefault) {
+    this.disabledByDefault = disabledByDefault;
+  }
+  isUnsupported(key) {
+    return this.unsupported.get(key) ?? this.disabledByDefault;
+  }
+  markUnsupported(key) {
+    this.unsupported.set(key, true);
+  }
+}
+
 // src/application/login.ts
 class LoginUseCase {
   options;
@@ -4057,7 +5575,7 @@ class LoginUseCase {
     const orgs = await this.options.app.organizations(jwt, signal);
     const orgId = pickOrg(orgs, credential.orgId, me.preferredOrgId);
     if (!orgId) {
-      throw new CapyError("invalid_request", "\u8FD9\u4E2A Capy \u8D26\u53F7\u6CA1\u6709\u7EC4\u7EC7\uFF08org\uFF09\uFF0C\u8BF7\u5148\u5728 Capy \u91CC\u5B8C\u6210\u521D\u59CB\u5316");
+      throw new CapyError("invalid_request", orgs.length > 1 ? "\u8FD9\u4E2A Capy \u8D26\u53F7\u6709\u591A\u4E2A\u7EC4\u7EC7\uFF0C\u8BF7\u5148\u9009\u4E00\u4E2A\u7EC4\u7EC7\u518D\u767B\u5F55\uFF08\u6682\u4E0D\u652F\u6301\u5728\u767B\u5F55\u65F6\u9009\u62E9\u7EC4\u7EC7\uFF09" : "\u8FD9\u4E2A Capy \u8D26\u53F7\u6CA1\u6709\u7EC4\u7EC7\uFF08org\uFF09\uFF0C\u8BF7\u5148\u5728 Capy \u91CC\u5B8C\u6210\u521D\u59CB\u5316");
     }
     const key = await this.options.app.mintApiKey(jwt, orgId, this.options.apiKeyName ?? "magpie-plugin", signal);
     const uid = String(me.id || credential.userId).trim();
@@ -4071,7 +5589,8 @@ class LoginUseCase {
       accessToken: key.plaintext,
       clerk,
       source: credential.source,
-      ...accountId ? { displayName: accountId } : {}
+      ...accountId ? { displayName: accountId } : {},
+      ...key.keyId ? { apiKeyId: key.keyId } : {}
     };
   }
 }
@@ -4117,6 +5636,8 @@ function forcedName(toolChoice) {
 
 class PromptToolBridge {
   instruction(tools, toolChoice) {
+    if (toolChoice === "none")
+      return "";
     const defs = tools.map(functionOf).filter((item) => Boolean(item));
     if (defs.length === 0)
       return "";
@@ -4139,16 +5660,8 @@ class PromptToolBridge {
     return lines.join(`
 `);
   }
-  parse(text) {
-    const direct = normalizeCalls(tryJson(text));
-    if (direct)
-      return { calls: direct };
-    for (const candidate of balancedObjects(text)) {
-      const calls = normalizeCalls(tryJson(candidate));
-      if (calls)
-        return { calls };
-    }
-    return null;
+  parse(text, allowedNames) {
+    return parseToolCalls(text, allowedNames);
   }
 }
 function normalizeArguments(value) {
@@ -4170,69 +5683,210 @@ function normalizeArguments(value) {
     return "{}";
   }
 }
-function normalizeCalls(value) {
-  if (!value || typeof value !== "object")
-    return null;
-  const record = value;
-  const raw = Array.isArray(record.tool_calls) ? record.tool_calls : Array.isArray(record.calls) ? record.calls : Array.isArray(value) ? value : [value];
+function callsFromArray(raw, allowed) {
   const calls = [];
   for (const item of raw) {
-    if (!item || typeof item !== "object")
+    if (!item || typeof item !== "object" || Array.isArray(item))
       continue;
     const record = item;
-    const fn = record.function ?? record;
+    const fn = record.function && typeof record.function === "object" && !Array.isArray(record.function) ? record.function : record;
     const name = typeof fn.name === "string" ? fn.name.trim() : "";
     if (!name)
       continue;
+    if (!allowed.has(name))
+      return null;
     calls.push({ name, arguments: normalizeArguments(fn.arguments) });
   }
   return calls.length > 0 ? calls : null;
 }
+function envelopeCalls(value, allowed) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return null;
+  const record = value;
+  if (!Array.isArray(record.tool_calls))
+    return null;
+  return callsFromArray(record.tool_calls, allowed);
+}
+function parseToolCalls(text, allowedNames) {
+  const allowed = new Set(allowedNames.map((name) => String(name).trim()).filter(Boolean));
+  if (allowed.size === 0)
+    return null;
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed)
+    return null;
+  const direct = tryJson(stripOneFence(trimmed));
+  if (direct !== undefined) {
+    const calls = envelopeCalls(direct, allowed);
+    return calls ? { calls } : null;
+  }
+  const objects = topLevelObjects(trimmed);
+  if (objects.length !== 1)
+    return null;
+  const parsed = tryJson(objects[0] ?? "");
+  if (parsed === undefined)
+    return null;
+  const calls = envelopeCalls(parsed, allowed);
+  return calls ? { calls } : null;
+}
+function stripOneFence(text) {
+  return FENCE.exec(text)?.[1]?.trim() ?? text;
+}
 function tryJson(text) {
   const trimmed = text.trim();
   if (!trimmed)
-    return null;
-  const unfenced = FENCE.exec(trimmed)?.[1]?.trim() ?? trimmed;
+    return;
   try {
-    return JSON.parse(unfenced);
+    return JSON.parse(trimmed);
   } catch {
-    return null;
+    return;
   }
 }
-function balancedObjects(text) {
+function topLevelObjects(text) {
   const out = [];
-  for (let start = 0;start < text.length; start += 1) {
-    if (text[start] !== "{")
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0;i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped)
+        escaped = false;
+      else if (ch === "\\")
+        escaped = true;
+      else if (ch === '"')
+        inString = false;
       continue;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let i = start;i < text.length; i += 1) {
-      const ch = text[i];
-      if (inString) {
-        if (escaped)
-          escaped = false;
-        else if (ch === "\\")
-          escaped = true;
-        else if (ch === '"')
-          inString = false;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") {
+      if (depth === 0)
+        start = i;
+      depth += 1;
+      continue;
+    }
+    if (ch === "}") {
+      if (depth === 0)
         continue;
-      }
-      if (ch === '"')
-        inString = true;
-      else if (ch === "{")
-        depth += 1;
-      else if (ch === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          out.push(text.slice(start, i + 1));
-          start = i;
-          break;
-        }
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        out.push(text.slice(start, i + 1));
+        start = -1;
+        if (out.length > 1)
+          return out;
       }
     }
   }
   return out;
+}
+
+// src/application/tool-sniff.ts
+var SNIFF_LIMIT_BYTES = 64 * 1024;
+var utf82 = new TextEncoder;
+function byteLength2(text) {
+  return utf82.encode(text).length;
+}
+
+class ObjectScanner {
+  depth = 0;
+  started = false;
+  inString = false;
+  escaped = false;
+  closed = false;
+  feed(text) {
+    for (const ch of text) {
+      if (this.closed)
+        return;
+      if (this.inString) {
+        if (this.escaped)
+          this.escaped = false;
+        else if (ch === "\\")
+          this.escaped = true;
+        else if (ch === '"')
+          this.inString = false;
+        continue;
+      }
+      if (ch === '"')
+        this.inString = true;
+      else if (ch === "{") {
+        this.depth += 1;
+        this.started = true;
+      } else if (ch === "}") {
+        this.depth -= 1;
+        if (this.started && this.depth === 0)
+          this.closed = true;
+      }
+    }
+  }
+  get isClosed() {
+    return this.closed;
+  }
+}
+async function sniffToolPrefix(events, allowedNames, limitBytes = SNIFF_LIMIT_BYTES) {
+  const iterator = events[Symbol.asyncIterator]();
+  const buffered = [];
+  const scanner = new ObjectScanner;
+  let buffer = "";
+  let bufferBytes = 0;
+  const asText = () => ({ kind: "text", events: replay(buffered, iterator) });
+  for (;; ) {
+    let step;
+    try {
+      step = await iterator.next();
+    } catch {
+      return asText();
+    }
+    if (step.done)
+      return asText();
+    const event = step.value;
+    buffered.push(event);
+    if (event.type === "delta") {
+      buffer += event.text;
+      bufferBytes += byteLength2(event.text);
+      const leading = buffer.trimStart();
+      if (leading === "")
+        continue;
+      if (leading[0] !== "{")
+        return asText();
+      scanner.feed(event.text);
+      if (scanner.isClosed) {
+        const candidate = buffer.trim();
+        const parsed = parseToolCalls(candidate, allowedNames);
+        if (!parsed)
+          return asText();
+        await closeQuietly(iterator);
+        return { kind: "tool", text: candidate, calls: parsed.calls };
+      }
+      if (bufferBytes > limitBytes)
+        return asText();
+      continue;
+    }
+    return asText();
+  }
+}
+async function closeQuietly(iterator) {
+  try {
+    await iterator.return?.(undefined);
+  } catch {}
+}
+async function* replay(buffered, iterator) {
+  try {
+    for (const event of buffered)
+      yield event;
+    for (;; ) {
+      const step = await iterator.next();
+      if (step.done)
+        return;
+      yield step.value;
+    }
+  } finally {
+    try {
+      await iterator.return?.(undefined);
+    } catch {}
+  }
 }
 
 // src/application/usage.ts
@@ -4244,7 +5898,7 @@ class UsageUseCase {
     this.options = options;
   }
   async load(apiKey, signal) {
-    const key = `usage:${apiKey.slice(-16)}`;
+    const key = `usage:${await keyHash(apiKey)}`;
     const hit = this.options.cache?.get(key);
     if (hit)
       return hit;
@@ -4288,7 +5942,7 @@ function buildUsage(usage, balance) {
     windows.push({
       name: "\u4F59\u989D",
       used: 100,
-      display: "\u65E0\u53EF\u7528\u4F59\u989D / \u672A\u8BA2\u9605",
+      display: "\u4F59\u989D\u672A\u77E5",
       ...resetsAt ? { resetsAt } : {}
     });
   }
@@ -4311,14 +5965,19 @@ function withDeviceWindow(snapshot, device) {
         name: "\u65E0\u5934\u8BBE\u5907",
         used: device.connected ? 0 : 100,
         aside: true,
-        display: device.connected ? `\u5DF2\u8FDE\u63A5${device.name ? ` \xB7 ${device.name}` : ""}` : "\u672A\u8FDE\u63A5\uFF08\u81EA\u52A8\u6CE8\u518C\u5931\u8D25\uFF0C\u770B\u63D2\u4EF6\u65E5\u5FD7\uFF09"
+        display: device.connected ? `\u5DF2\u8FDE\u63A5${device.name ? ` \xB7 ${device.name}` : ""}` : "\u672A\u8FDE\u63A5\uFF08\u70B9\u51FB\u5BF9\u8BDD\u540E\u81EA\u52A8\u8FDE\u63A5\uFF09"
       }
     ]
   };
 }
 function money(value, currency = "USD") {
   const symbol = currency === "USD" ? "$" : `${currency} `;
-  return `${symbol}${value.toFixed(value >= 100 ? 0 : 2)}`;
+  if (!Number.isFinite(value))
+    return `${symbol}0`;
+  const sign = value < 0 ? "-" : "";
+  const abs = Math.abs(value);
+  const body = Number.isInteger(abs) ? String(abs) : abs.toFixed(2);
+  return `${sign}${symbol}${body}`;
 }
 function tokensText(tokens) {
   const input = Number(tokens?.inputTokens);
@@ -4353,6 +6012,8 @@ function parseChatRequest(body) {
   const messagesRaw = body.messages;
   if (!Array.isArray(messagesRaw) || messagesRaw.length === 0)
     throw invalid("messages \u4E3A\u7A7A");
+  if (messagesRaw.length > 200)
+    throw invalid("messages \u6700\u591A 200 \u6761");
   const messages = messagesRaw.map(parseMessage);
   const model = typeof body.model === "string" ? body.model.trim() : "";
   if (!model)
@@ -4362,7 +6023,7 @@ function parseChatRequest(body) {
   return {
     model,
     messages,
-    stream: body.stream === true,
+    stream: body.stream === true || body.stream === 1 || body.stream === "1" || body.stream === "true",
     ...reasoningEffort ? { reasoningEffort } : {},
     ...Array.isArray(body.tools) ? { tools: body.tools.map(parseTool) } : {},
     ...body.tool_choice === undefined ? {} : { toolChoice: body.tool_choice }
@@ -4376,7 +6037,7 @@ function parseMessage(value) {
     throw invalid(`\u4E0D\u652F\u6301\u7684 role: ${String(role)}`);
   }
   const content = parseContent(value.content);
-  const toolCalls = parseToolCalls(value.tool_calls);
+  const toolCalls = parseToolCalls2(value.tool_calls);
   return {
     role,
     content,
@@ -4385,7 +6046,7 @@ function parseMessage(value) {
     ...toolCalls ? { toolCalls } : {}
   };
 }
-function parseToolCalls(value) {
+function parseToolCalls2(value) {
   if (!Array.isArray(value))
     return;
   const calls = [];
@@ -4553,11 +6214,13 @@ function encodeCompletion(id, model, created, text, usage) {
 }
 function encodeErrorResponse(error) {
   const body = toOpenAiError(error);
+  const retryAfter = retryAfterSeconds(error);
   return new Response(JSON.stringify(body), {
     status: body.error.status,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      ...body.error.status === 401 ? { "x-magpie-sign-in": "expired" } : {}
+      ...body.error.status === 401 ? { "x-magpie-sign-in": "expired" } : {},
+      ...body.error.status === 429 && retryAfter !== null ? { "retry-after": String(retryAfter) } : {}
     }
   });
 }
@@ -4583,53 +6246,103 @@ function encodeModelList(models, provider) {
     }))
   }), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
 }
-function encodeChatStream(events, meta, usage) {
+function encodeChatStream(events, meta, usage, onCancel) {
   const encoder = new TextEncoder;
+  const iterator = events[Symbol.asyncIterator]();
+  let closed = false;
+  let roleSent = false;
+  let emitted = false;
+  let text = "";
   const stream = new ReadableStream({
-    async start(controller) {
-      const push = (text) => controller.enqueue(encoder.encode(text));
-      const pushUsage = (completionText) => {
-        if (!usage)
+    async pull(controller) {
+      if (closed)
+        return;
+      const push = (chunk) => {
+        if (closed)
           return;
-        push(encodeUsageChunk(meta, {
-          promptTokens: usage.promptTokens,
-          completionTokens: usage.estimateCompletionTokens(completionText)
-        }));
+        controller.enqueue(encoder.encode(chunk));
       };
-      push(encodeChunk(meta, { role: "assistant", content: "" }));
-      let emitted = false;
-      let text = "";
-      try {
-        for await (const event of events) {
-          if (event.type === "delta") {
+      const sendRole = () => {
+        if (roleSent)
+          return;
+        roleSent = true;
+        push(encodeChunk(meta, { role: "assistant", content: "" }));
+      };
+      const finish = () => {
+        if (closed)
+          return;
+        push(encodeChunk(meta, {}, "stop"));
+        if (usage) {
+          push(encodeUsageChunk(meta, {
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.estimateCompletionTokens(text)
+          }));
+        }
+        push(SSE_DONE);
+        closed = true;
+        controller.close();
+      };
+      const fail = (error) => {
+        if (closed)
+          return;
+        push(encodeSseError(error));
+        closed = true;
+        controller.close();
+      };
+      for (;; ) {
+        if (closed)
+          return;
+        let step;
+        try {
+          step = await iterator.next();
+        } catch (error) {
+          fail(error);
+          return;
+        }
+        if (closed)
+          return;
+        if (step.done) {
+          fail(new CapyError("upstream_unavailable", "\u4E0A\u6E38\u6D41\u5728\u5B8C\u6210\u524D\u4E2D\u65AD"));
+          return;
+        }
+        const event = step.value;
+        if (event.type === "delta") {
+          sendRole();
+          emitted = true;
+          text += event.text;
+          push(encodeContentDelta(meta, event.text));
+          return;
+        }
+        if (event.type === "final") {
+          if (!emitted && event.text) {
+            sendRole();
             emitted = true;
-            text += event.text;
+            text = event.text;
             push(encodeContentDelta(meta, event.text));
-          } else if (event.type === "error") {
-            push(encodeSseError(event.error));
-            controller.close();
-            return;
-          } else if (event.type === "final") {
-            if (!emitted && event.text) {
-              text = event.text;
-              push(encodeContentDelta(meta, event.text));
-            }
-          } else if (event.type === "done") {
-            push(encodeChunk(meta, {}, "stop"));
-            pushUsage(text);
-            push(SSE_DONE);
-            controller.close();
             return;
           }
+          continue;
         }
-        push(encodeChunk(meta, {}, "stop"));
-        pushUsage(text);
-        push(SSE_DONE);
-        controller.close();
-      } catch (error) {
-        push(encodeSseError(error));
-        controller.close();
+        if (event.type === "error") {
+          fail(event.error);
+          return;
+        }
+        if (event.type === "done") {
+          finish();
+          return;
+        }
       }
+    },
+    async cancel(reason) {
+      if (closed)
+        return;
+      closed = true;
+      try {
+        onCancel?.(reason);
+      } catch {}
+      try {
+        await iterator.return?.(undefined);
+      } catch {}
     }
   });
   return new Response(stream, {
@@ -4653,6 +6366,22 @@ var DEFAULT_PROVIDER_ID = "capy";
 var SDK = "@ai-sdk/openai-compatible";
 var MAX_CONCURRENCY = 2;
 var REFRESH_LEAD_MS = 24 * 3600000;
+var MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
+var UNSUPPORTED_PARAMS = [
+  "temperature",
+  "top_p",
+  "max_tokens",
+  "max_completion_tokens",
+  "presence_penalty",
+  "frequency_penalty",
+  "logit_bias",
+  "stop",
+  "n",
+  "seed",
+  "response_format",
+  "logprobs",
+  "user"
+];
 function toMagpieModel(model, providerId, toolsEnabled) {
   const variants = model.reasoningModes.length > 0 ? Object.fromEntries(model.reasoningModes.map((mode) => [mode, {}])) : undefined;
   return {
@@ -4687,16 +6416,54 @@ function staticModels(providerId, toolsEnabled) {
   const models = freeFirst(mergeCatalog(STATIC_CATALOG, EXTRA_FREE_MODELS)).map((raw) => describeModel(raw, { toolsEnabled }));
   return modelMap(models, providerId, toolsEnabled);
 }
+function assertBodySize(bytes) {
+  if (bytes > MAX_REQUEST_BODY_BYTES) {
+    throw new CapyError("invalid_request", "\u8BF7\u6C42\u4F53\u8D85\u8FC7 2MB \u4E0A\u9650", { status: 413 });
+  }
+}
+async function readBodyText(input, init) {
+  if (typeof init.body === "string") {
+    assertBodySize(Buffer.byteLength(init.body));
+    return init.body;
+  }
+  if (init.body instanceof Uint8Array) {
+    assertBodySize(init.body.byteLength);
+    return new TextDecoder().decode(init.body);
+  }
+  const stream = init.body ? new Response(init.body).body : input instanceof Request ? input.body : null;
+  if (!stream)
+    return "";
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;; ) {
+    const { done, value } = await reader.read();
+    if (done)
+      break;
+    if (!value)
+      continue;
+    total += value.byteLength;
+    if (total > MAX_REQUEST_BODY_BYTES) {
+      await reader.cancel().catch(() => {
+        return;
+      });
+      throw new CapyError("invalid_request", "\u8BF7\u6C42\u4F53\u8D85\u8FC7 2MB \u4E0A\u9650", { status: 413 });
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
 async function readJsonBody(input, init) {
-  if (typeof init.body === "string")
-    return JSON.parse(init.body);
-  if (init.body instanceof Uint8Array)
-    return JSON.parse(new TextDecoder().decode(init.body));
-  if (init.body)
-    return JSON.parse(await new Response(init.body).text());
-  if (input instanceof Request)
-    return JSON.parse(await input.text());
-  return {};
+  const text = await readBodyText(input, init);
+  if (!text.trim())
+    return {};
+  return JSON.parse(text);
 }
 function loginErrorText(error) {
   if (error instanceof CapyError)
@@ -4707,31 +6474,35 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
   const providerId = String(options.providerId || process.env.MAGPIE_CAPY_PROVIDER_ID || DEFAULT_PROVIDER_ID).trim();
   const toolsEnabled = options.toolsEnabled !== false;
   const configuredVariant = String(options.promptVariant ?? process.env.MAGPIE_CAPY_PROMPT_VARIANT ?? "auto").trim().toLowerCase();
-  let minimalUnsupported = configuredVariant === "default" || configuredVariant === "off";
+  const minimalGate = new MinimalVariantGate(configuredVariant === "default" || configuredVariant === "off");
+  const clock = new SystemClock;
+  const ids = new SystemIds;
+  const logger = new ConsoleLogger("capy");
+  const refreshInflight = new Map;
   const proxyUrl = resolveProxyUrl({
     ...options.proxy === undefined ? {} : { proxy: options.proxy }
   });
   const fetchImpl = createProxyFetch(fetch, proxyUrl, {
-    onWarn: (message) => console.warn(`[magpie-capy] ${message}`)
+    onWarn: (message) => logger.warn(message)
   });
-  const clock = new SystemClock;
-  const ids = new SystemIds;
-  const logger = new ConsoleLogger("capy");
-  if (proxyUrl) {
-    let host = "configured";
-    try {
-      const parsed = new URL(proxyUrl);
-      host = `${parsed.hostname}:${parsed.port || "default"}`;
-    } catch {}
-    logger.event("proxy_enabled", { proxy: host });
-  }
+  if (proxyUrl)
+    logger.event("proxy_enabled", { proxy: describeProxy(proxyUrl) });
+  const attachmentFetch = createGuardedFetch(fetch, {
+    maxRedirects: 3,
+    timeoutMs: 15000,
+    allowPorts: [80, 443],
+    onBlock: (reason) => logger.warn("attachment fetch blocked", { reason })
+  });
   const cache = new MemoryCache(() => clock.now());
-  const app = new CapyAppClient(fetchImpl, undefined, createDesktopVersionProbe({ fetchImpl }));
+  const app = new CapyAppClient(fetchImpl, undefined, createDesktopVersionProbe({
+    fetchImpl,
+    onWarn: (message) => logger.warn(message)
+  }));
   const publicApi = new CapyPublicClient(fetchImpl);
-  const store = new FileSecretStore;
+  const store = new FileSecretStore(undefined, { onWarn: (message) => logger.warn(message) });
   const runtime = new HeadlessDeviceRuntime({ app, store, clock, logger });
   const device = new DeviceUseCase(runtime);
-  const login = new LoginUseCase({ app, sources: new CapyLoginSources });
+  const login = new LoginUseCase({ app, sources: new CapyLoginSources(logger) });
   const catalog = new CatalogUseCase({
     publicPort: publicApi,
     fallback: STATIC_CATALOG,
@@ -4786,7 +6557,7 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
                 try {
                   return await probe;
                 } catch (error) {
-                  return { type: "failed", error: loginErrorText(error) };
+                  return { type: "failed", error: redact(loginErrorText(error)) };
                 }
               }
             };
@@ -4811,7 +6582,7 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
                 try {
                   return await probe;
                 } catch (error) {
-                  return { type: "failed", error: loginErrorText(error) };
+                  return { type: "failed", error: redact(loginErrorText(error)) };
                 } finally {
                   callbackOptions.signal?.removeEventListener("abort", onAbort);
                   controller.abort();
@@ -4863,28 +6634,48 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
         } catch {
           throw Object.assign(new Error("Capy \u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55"), { signIn: "expired" });
         }
+        const key = accountKey(session);
+        const inFlight = refreshInflight.get(key);
+        if (inFlight)
+          return inFlight;
+        const task = (async () => {
+          let clerkValid = true;
+          try {
+            await app.sessionJwt(session.clerk);
+          } catch (error) {
+            if (error instanceof CapyError && error.kind === "sign_in_required")
+              clerkValid = false;
+            else
+              return;
+          }
+          if (clerkValid) {
+            try {
+              await publicApi.listModels(session.accessToken);
+              return authRecordOf(session, { expires: Date.now() + 7 * 24 * 3600000 });
+            } catch (error) {
+              if (!(error instanceof CapyError) || error.kind !== "sign_in_required")
+                return;
+            }
+          }
+          try {
+            return await complete({
+              clientJwt: session.clerk.clientJwt,
+              sessionId: session.clerk.sessionId,
+              userId: session.uid,
+              orgId: session.orgId,
+              clientId: session.clientId,
+              source: "refresh"
+            });
+          } catch {
+            throw Object.assign(new Error("Capy \u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55"), { signIn: "expired" });
+          }
+        })();
+        refreshInflight.set(key, task);
         try {
-          await publicApi.listModels(session.accessToken);
-          return { access: session.accessToken, expires: Date.now() + 7 * 24 * 3600000 };
-        } catch (error) {
-          if (!(error instanceof CapyError) || error.kind !== "sign_in_required")
-            return;
-        }
-        try {
-          const renewed = await complete({
-            clientJwt: session.clerk.clientJwt,
-            sessionId: session.clerk.sessionId,
-            userId: session.uid,
-            orgId: session.orgId,
-            clientId: session.clientId,
-            source: "refresh"
-          });
-          return {
-            access: typeof renewed.access === "string" ? renewed.access : "",
-            expires: typeof renewed.expires === "number" ? renewed.expires : Date.now() + 7 * 24 * 3600000
-          };
-        } catch {
-          throw Object.assign(new Error("Capy \u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55"), { signIn: "expired" });
+          return await task;
+        } finally {
+          if (refreshInflight.get(key) === task)
+            refreshInflight.delete(key);
         }
       },
       async loader(getAuth) {
@@ -4900,6 +6691,7 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
             } catch (error) {
               return encodeErrorResponse(error);
             }
+            const key = accountKey(session);
             const request = input instanceof Request ? input : null;
             const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : request?.url ?? "";
             const method = String(init.method ?? request?.method ?? "GET").toUpperCase();
@@ -4913,13 +6705,24 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
               if (!/\/chat\/completions$/u.test(route)) {
                 return encodeErrorResponse(new CapyError("not_implemented", `\u8BE5\u7AEF\u70B9\u6CA1\u6709\u5B9E\u73B0\uFF1A${method} ${url}`));
               }
+              if (method !== "POST") {
+                return encodeErrorResponse(new CapyError("invalid_request", "chat/completions \u53EA\u652F\u6301 POST", { status: 405 }));
+              }
               let body;
               try {
                 body = await readJsonBody(input, init);
-              } catch {
+              } catch (error) {
+                if (error instanceof CapyError)
+                  return encodeErrorResponse(error);
                 return encodeErrorResponse(new CapyError("invalid_request", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5 JSON"));
               }
               const requestBody = parseChatRequest(body);
+              if (body !== null && typeof body === "object" && !Array.isArray(body)) {
+                const raw = body;
+                const ignored = UNSUPPORTED_PARAMS.filter((name) => raw[name] !== undefined);
+                if (ignored.length > 0)
+                  logger.warn("\u8BF7\u6C42\u91CC\u4E0D\u652F\u6301\u7684\u53C2\u6570\u5DF2\u5FFD\u7565", { params: ignored.join(",") });
+              }
               const promptTokens = estimateTokensOfMessages(requestBody.messages);
               const snapshot = await catalog.load(session.accessToken, signal);
               const modelId = resolveModelId(requestBody.model, snapshot.models);
@@ -4927,6 +6730,7 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
               const reasoningMode = reasoningModeOf(requestBody, model);
               const prepared = await collectAttachments(requestBody.messages, {
                 fetchImpl,
+                directFetch: attachmentFetch,
                 ...signal ? { signal } : {}
               });
               const files = prepared.attachments.length > 0 ? await publicApi.uploadFiles(session.accessToken, prepared.attachments, signal) : [];
@@ -4936,56 +6740,73 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
                   chat.cancel(session, activeThreadId);
               };
               signal?.addEventListener("abort", onAbort, { once: true });
-              const events = chat.stream(session, {
-                ...requestBody,
-                messages: prepared.messages
-              }, {
-                ...signal ? { signal } : {},
-                ...reasoningMode ? { reasoningMode } : {},
-                ...files.length > 0 ? { files } : {},
-                onThread: (thread) => {
-                  activeThreadId = thread.id;
-                },
-                onVariantFallback: () => {
-                  minimalUnsupported = true;
-                },
-                ...minimalUnsupported ? {} : { promptVariant: "minimal" }
-              });
-              const meta = {
-                id: `chatcmpl-${ids.ulid()}`,
-                model: modelId,
-                created: Math.floor(clock.now() / 1000)
-              };
-              const wantsTools = toolsEnabled && (requestBody.tools?.length ?? 0) > 0;
-              if (wantsTools) {
-                const text = await textOf(events);
-                const parsed = text ? tools.parse(text) : null;
-                if (parsed) {
-                  const calls = parsed.calls.map((call) => ({
-                    id: `call_${ids.ulid()}`,
-                    name: call.name,
-                    arguments: call.arguments
-                  }));
-                  return requestBody.stream ? encodeToolCallStream(meta, calls, {
+              try {
+                const events = chat.stream(session, {
+                  ...requestBody,
+                  messages: prepared.messages
+                }, {
+                  ...signal ? { signal } : {},
+                  modelId,
+                  ...reasoningMode ? { reasoningMode } : {},
+                  ...files.length > 0 ? { files } : {},
+                  onThread: (thread) => {
+                    activeThreadId = thread.id;
+                  },
+                  onVariantFallback: () => {
+                    minimalGate.markUnsupported(key);
+                  },
+                  ...minimalGate.isUnsupported(key) ? {} : { promptVariant: "minimal" }
+                });
+                const meta = {
+                  id: `chatcmpl-${ids.ulid()}`,
+                  model: modelId,
+                  created: Math.floor(clock.now() / 1000)
+                };
+                const allowedNames = (requestBody.tools ?? []).map((tool) => tool.function.name);
+                const wantsTools = toolsEnabled && (requestBody.tools?.length ?? 0) > 0;
+                if (wantsTools) {
+                  const sniffed = await sniffToolPrefix(events, allowedNames);
+                  if (sniffed.kind === "tool") {
+                    const calls = sniffed.calls.map((call) => ({
+                      id: `call_${ids.ulid()}`,
+                      name: call.name,
+                      arguments: call.arguments
+                    }));
+                    const completionTokens = estimateTokens(calls.map((call) => `${call.name}${call.arguments}`).join(""));
+                    return requestBody.stream ? encodeToolCallStream(meta, calls, { promptTokens, completionTokens }) : encodeToolCallCompletion(meta.id, meta.model, meta.created, calls, { promptTokens, completionTokens });
+                  }
+                  if (requestBody.stream) {
+                    return encodeChatStream(sniffed.events, meta, {
+                      promptTokens,
+                      estimateCompletionTokens: estimateTokens
+                    }, () => {
+                      if (activeThreadId)
+                        chat.cancel(session, activeThreadId);
+                    });
+                  }
+                  const text = await textOf(sniffed.events);
+                  return encodeCompletion(meta.id, meta.model, meta.created, text, {
                     promptTokens,
-                    completionTokens: estimateTokens(calls.map((call) => `${call.name}${call.arguments}`).join(""))
-                  }) : encodeToolCallCompletion(meta.id, meta.model, meta.created, calls, {
-                    promptTokens,
-                    completionTokens: estimateTokens(calls.map((call) => `${call.name}${call.arguments}`).join(""))
+                    completionTokens: estimateTokens(text)
                   });
                 }
-                return requestBody.stream ? encodeChatStream(textEvents(text), meta, { promptTokens, estimateCompletionTokens: estimateTokens }) : encodeCompletion(meta.id, meta.model, meta.created, text, {
+                if (requestBody.stream) {
+                  return encodeChatStream(events, meta, {
+                    promptTokens,
+                    estimateCompletionTokens: estimateTokens
+                  }, () => {
+                    if (activeThreadId)
+                      chat.cancel(session, activeThreadId);
+                  });
+                }
+                const text = await textOf(events);
+                return encodeCompletion(meta.id, meta.model, meta.created, text, {
                   promptTokens,
                   completionTokens: estimateTokens(text)
                 });
+              } finally {
+                signal?.removeEventListener("abort", onAbort);
               }
-              if (requestBody.stream)
-                return encodeChatStream(events, meta, { promptTokens, estimateCompletionTokens: estimateTokens });
-              const text = await textOf(events);
-              return encodeCompletion(meta.id, meta.model, meta.created, text, {
-                promptTokens,
-                completionTokens: estimateTokens(text)
-              });
             } catch (error) {
               return encodeErrorResponse(error);
             }
@@ -5001,19 +6822,14 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
         }
         try {
           const snapshot = await usage.load(session.accessToken);
-          let deviceWindow = { connected: false, name: "" };
-          try {
-            const info = await device.ensure(session);
-            deviceWindow = { connected: true, name: info.name };
-          } catch {
-            deviceWindow = { connected: false, name: "" };
-          }
+          const info = device.peek(session);
+          const deviceWindow = { connected: info.connected, name: info.connected ? info.name : "" };
           return withDeviceWindow(snapshot, deviceWindow);
         } catch (error) {
           if (error instanceof CapyError && error.kind === "sign_in_required") {
             return { error: "Capy \u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55", windows: [], signIn: "expired" };
           }
-          return { error: loginErrorText(error), windows: [] };
+          return { error: redact(loginErrorText(error)), windows: [] };
         }
       }
     },
@@ -5026,13 +6842,11 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
           return initialModels;
         }
       }
+    },
+    dispose() {
+      device.close();
     }
   };
-}
-async function* textEvents(text) {
-  if (text)
-    yield { type: "delta", text };
-  yield { type: "done" };
 }
 async function textOf(events) {
   let text = "";

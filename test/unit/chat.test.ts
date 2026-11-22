@@ -81,6 +81,7 @@ function fakePublic(frames: UpstreamSseFrame[]): CapyPublicPort {
 function fakeRuntime(): DeviceRuntimePort {
   return {
     async ensure() { return device; },
+    peek() { return device; },
     close() {},
   };
 }
@@ -130,7 +131,7 @@ test("ChatUseCase：ensure → createJam → SSE → 事件", async () => {
   expect(calls[0]?.clientKey).toBe(calls[0]?.requestId);
 });
 
-test("ChatUseCase：大段 delta 会被平滑切分（burst 不再一次发完）", async () => {
+test("ChatUseCase：大段 delta 不再被平滑切分，直接原样发出（pacing 已删，M-11）", async () => {
   const big = "你好世界".repeat(60);
   const { app } = fakeApp();
   const useCase = new ChatUseCase({
@@ -150,11 +151,7 @@ test("ChatUseCase：大段 delta 会被平滑切分（burst 不再一次发完�
   for await (const event of useCase.stream(session, request)) events.push(event);
 
   const deltas = events.filter((e): e is { type: "delta"; text: string } => (e as { type: string }).type === "delta");
-  expect(deltas.length).toBeGreaterThan(1);
-  expect(deltas.map((d) => d.text).join("")).toBe(big);
-  for (const d of deltas) {
-    expect(Array.from(d.text).length).toBeLessThanOrEqual(40);
-  }
+  expect(deltas).toEqual([{ type: "delta", text: big }]);
 });
 
 test("ChatUseCase：ADS 模型建线程带 ads 能力位", async () => {
@@ -316,4 +313,224 @@ test("ChatUseCase：流开始前 429 只出一个 error 事件（rate_limited）
     expect(events[0].error.kind).toBe("rate_limited");
     expect(events[0].error.status).toBe(429);
   }
+});
+
+test("ChatUseCase：并发 stream 共享同一次 sessionJwt（single-flight，H-13(3)）", async () => {
+  const base = fakeApp();
+  let jwtCalls = 0;
+  const app: CapyAppPort = {
+    ...base.app,
+    async sessionJwt() {
+      jwtCalls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return "jwt";
+    },
+  };
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: fakePublic([
+      sse("assistant", { callId: "c1", text: "pong" }),
+      sse("done", {}),
+    ]),
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+  const drain = async () => {
+    const out = [];
+    for await (const event of useCase.stream(session, request)) out.push(event);
+    return out;
+  };
+  const [first, second] = await Promise.all([drain(), drain()]);
+  expect(jwtCalls).toBe(1);
+  expect(first[first.length - 1]).toEqual({ type: "done" });
+  expect(second[second.length - 1]).toEqual({ type: "done" });
+});
+
+test("ChatUseCase：run.modelId 优先于 request.model，createJam 与 ads 都用它（H-14(1)）", async () => {
+  const { app, calls } = fakeApp();
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: fakePublic([sse("done", {})]),
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+  for await (const _event of useCase.stream(session, { ...request, model: "short-name" }, {
+    modelId: "zai/glm-5.3-flash-ads",
+  })) { /* drain */ }
+  expect(calls[0]?.modelId).toBe("zai/glm-5.3-flash-ads");
+  expect(calls[0]?.ads).toBe(true);
+});
+
+test("ChatUseCase：minimal 遇到 403 就不带 variant 重试一次（H-13(1) 回归）", async () => {
+  const base = fakeApp();
+  let calls = 0;
+  const app: CapyAppPort = {
+    ...base.app,
+    async createJam(_jwt: string, _org: string, input: CreateJamInput): Promise<JamCreated> {
+      calls += 1;
+      if (calls === 1) {
+        throw new CapyError("upstream_error", "minimal variant not supported", {
+          status: 403,
+          detail: "promptVariant not supported for this account",
+        });
+      }
+      return { id: input.jamId, primaryMachine: { kind: "device", name: "magpie-headless" }, ask: null };
+    },
+  };
+  let fallback = 0;
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: fakePublic([sse("done", {})]),
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+  const events = [];
+  for await (const event of useCase.stream(session, request, {
+    promptVariant: "minimal",
+    onVariantFallback: () => { fallback += 1; },
+  })) events.push(event);
+  expect(calls).toBe(2);
+  expect(fallback).toBe(1);
+  expect(events[events.length - 1]).toEqual({ type: "done" });
+});
+
+test("ChatUseCase：minimal 403 且 detail 不含 variant（Capy 真实返回 capy/Forbidden）也降级重试（H-13(1) 回归）", async () => {
+  const base = fakeApp();
+  let calls = 0;
+  const variants: (string | undefined)[] = [];
+  const app: CapyAppPort = {
+    ...base.app,
+    async createJam(_jwt: string, _org: string, input: CreateJamInput): Promise<JamCreated> {
+      calls += 1;
+      variants.push(input.promptVariant);
+      if (calls === 1) {
+        // Capy 真实返回 {"_tag":"capy/Forbidden"}，detail 里没有 variant 这个词。
+        throw new CapyError("upstream_error", "forbidden", { status: 403, detail: "capy/Forbidden" });
+      }
+      return { id: input.jamId, primaryMachine: { kind: "device", name: "magpie-headless" }, ask: null };
+    },
+  };
+  let fallback = 0;
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: fakePublic([sse("done", {})]),
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+  const events = [];
+  for await (const event of useCase.stream(session, request, {
+    promptVariant: "minimal",
+    onVariantFallback: () => { fallback += 1; },
+  })) events.push(event);
+  expect(calls).toBe(2);
+  expect(variants).toEqual(["minimal", undefined]);
+  expect(fallback).toBe(1);
+  expect(events[events.length - 1]).toEqual({ type: "done" });
+});
+
+test("ChatUseCase：minimal 降级重试也 403 → 错误透传，只重试一次（H-13(1) 回归）", async () => {
+  const base = fakeApp();
+  let calls = 0;
+  const app: CapyAppPort = {
+    ...base.app,
+    async createJam(): Promise<JamCreated> {
+      calls += 1;
+      throw new CapyError("upstream_error", "forbidden", { status: 403, detail: "capy/Forbidden" });
+    },
+  };
+  let fallback = 0;
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: fakePublic([]),
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+  let caught: unknown = null;
+  try {
+    for await (const _event of useCase.stream(session, request, {
+      promptVariant: "minimal",
+      onVariantFallback: () => { fallback += 1; },
+    })) { /* drain */ }
+  } catch (error) {
+    caught = error;
+  }
+  expect(calls).toBe(2);
+  expect(fallback).toBe(1);
+  expect(caught).toBeInstanceOf(CapyError);
+});
+
+test("ChatUseCase：消费方中途取消 → interruptJam（M-11）", async () => {
+  const { app, interrupted } = fakeApp();
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: fakePublic([
+      sse("assistant", { callId: "c1", text: "po" }),
+      sse("assistant", { callId: "c1", text: "pong" }),
+      sse("done", {}),
+    ]),
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+  const iterator = useCase.stream(session, request)[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  expect(first.value).toEqual({ type: "delta", text: "po" });
+  await iterator.return?.(undefined);
+  expect(interrupted()).toBe(1);
+});
+
+test("ChatUseCase：见 done 即断开，不再拉取后续帧（H-11）", async () => {
+  const { app } = fakeApp();
+  const frames = [
+    sse("assistant", { callId: "c1", text: "pong" }),
+    sse("done", {}),
+    sse("assistant", { callId: "c1", text: "late" }),
+  ];
+  let pulled = 0;
+  const countingPublic: CapyPublicPort = {
+    async listModels() { return { items: [] }; },
+    async *streamThread() {
+      for (const frame of frames) {
+        pulled += 1;
+        yield frame;
+      }
+    },
+    async uploadFiles() { return []; },
+    async usage() { return {}; },
+    async balance() { return {}; },
+  };
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: countingPublic,
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+  const events = [];
+  for await (const event of useCase.stream(session, request)) events.push(event);
+  expect(pulled).toBe(2);
+  expect(events).toEqual([
+    { type: "delta", text: "pong" },
+    { type: "final", text: "pong" },
+    { type: "done" },
+  ]);
 });

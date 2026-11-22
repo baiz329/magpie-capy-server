@@ -3,6 +3,7 @@ import { describeModel, EXTRA_FREE_MODELS, freeFirst, mergeCatalog } from "../do
 import { CapyError, isAuthError } from "../domain/errors.ts";
 import type { CapyPublicPort } from "../ports/capy-public.ts";
 import type { CachePort } from "../ports/platform.ts";
+import { keyHash } from "./key-hash.ts";
 
 export interface CatalogUseCaseOptions {
   readonly publicPort: CapyPublicPort;
@@ -28,7 +29,8 @@ export class CatalogUseCase {
   }
 
   async load(apiKey: string, signal?: AbortSignal): Promise<CatalogSnapshot> {
-    const cacheKey = `catalog:${apiKey.slice(-16)}`;
+    // 缓存键用密钥哈希，不用 apiKey 尾部（M-05）。
+    const cacheKey = `catalog:${await keyHash(apiKey)}`;
     const hit = this.options.cache?.get<CatalogSnapshot>(cacheKey);
     if (hit) return hit;
     const snapshot = await this.loadSnapshot(apiKey, signal);

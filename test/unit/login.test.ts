@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 
 import { LoginUseCase } from "../../src/application/login.ts";
+import { authRecordOf, sessionOfAuth } from "../../src/adapters/host/magpie-auth.ts";
 import type { CapyAppPort } from "../../src/ports/capy-app.ts";
 import { combineCookieInputs, cookieCredentialOf } from "../../src/adapters/capy/cookie-login.ts";
 import type { LoginCredential, LoginSourcePort } from "../../src/ports/login.ts";
@@ -116,13 +117,19 @@ test("combineCookieInputs：只填一框原样返回；JSON 导出自包含", ()
   expect(combineCookieInputs("", `__session=${session}`)).toBe(`__session=${session}`);
   // 只填第一框且没有会话信息 → 解析时提示补第二框
   expect(() => cookieCredentialOf(combineCookieInputs(header, ""))).toThrow("sessionId");
-  // 任一框是 JSON 导出时直接用它（自包含，同时含 __client 与 __session）
+  // JSON 导出框合并：同名第一框优先，第二框独有的 cookie 得以保留（M-17）。
+  // 第一框自包含也不再整框丢弃第二框；合并后是 header 串，不再是原 JSON。
   const json = JSON.stringify([
     { name: "__client", value: client, domain: "clerk.capy.ai" },
     { name: "__session", value: session, domain: "capy.ai" },
   ]);
-  expect(combineCookieInputs(json, session)).toBe(json);
-  expect(combineCookieInputs(header, json)).toBe(json);
+  expect(cookieCredentialOf(combineCookieInputs(json, session)).sessionId).toBe("sess_cookie");
+  expect(cookieCredentialOf(combineCookieInputs(header, json)).sessionId).toBe("sess_cookie");
+  const withExtra = combineCookieInputs(json, JSON.stringify([
+    { name: "__session_VSH_xxx", value: session, domain: "capy.ai" },
+  ]));
+  expect(withExtra).toContain("__session_VSH_xxx");
+  expect(cookieCredentialOf(withExtra).sessionId).toBe("sess_cookie");
   expect(cookieCredentialOf(combineCookieInputs(json, "")).sessionId).toBe("sess_cookie");
 });
 
@@ -182,4 +189,56 @@ test("login：没有组织 → invalid_request", async () => {
     sources: fakeSources({ clientJwt: "c", sessionId: "s", userId: "u", source: "local" }),
   });
   await expect(useCase.login("local")).rejects.toMatchObject({ kind: "invalid_request", status: 400 });
+});
+
+test("login：mint 的 keyId 记录进 session，authRecordOf 往返保留；expires 可覆盖", async () => {
+  const useCase = new LoginUseCase({
+    app: fakeApp(),
+    sources: fakeSources({
+      clientJwt: "client",
+      sessionId: "sess_1",
+      userId: "user_1",
+      source: "local",
+    }),
+  });
+  const session = await useCase.login("local");
+  expect(session.apiKeyId).toBe("key_1");
+  const record = authRecordOf(session);
+  expect((record.metadata as { keyId?: string }).keyId).toBe("key_1");
+  expect(sessionOfAuth(record).apiKeyId).toBe("key_1");
+  expect(authRecordOf(session, { expires: 123 }).expires).toBe(123);
+});
+
+test("cookieCredentialOf：单条 {name, value} 对象特判（M-17）", () => {
+  const client = jwt({ id: "client_id" });
+  const session = jwt({ sid: "sess_cookie" });
+  // 单个对象不是数组：以前会被拆成 name=/value= 两对，现在认作一条 cookie。
+  // 只有 __client、没有会话信息时报缺 sessionId（而不是报缺 __client）。
+  expect(() => cookieCredentialOf(JSON.stringify({ name: "__client", value: client }))).toThrow("sessionId");
+  expect(cookieCredentialOf(`__client=${client}; __session=${session}`).sessionId).toBe("sess_cookie");
+});
+
+test("cookieCredentialOf：不透明 __session 直接用作 session id 回退（M-17）", () => {
+  const client = jwt({ id: "client_id" });
+  const credential = cookieCredentialOf(`__client=${client}; __session=opaque-token-123`);
+  expect(credential.sessionId).toBe("opaque-token-123");
+});
+
+test("login：多组织无偏好 → 报错文案是“有多个组织”，不是“没有组织”（M-18）", async () => {
+  const app = fakeApp({
+    async me() { return { id: "user_1" }; },
+    async organizations() { return [{ id: "org_1" }, { id: "org_2" }]; },
+  });
+  const useCase = new LoginUseCase({
+    app,
+    sources: fakeSources({ clientJwt: "c", sessionId: "s", userId: "u", source: "local" }),
+  });
+  try {
+    await useCase.login("local");
+    throw new Error("expected rejection");
+  } catch (error) {
+    expect(error).toMatchObject({ kind: "invalid_request" });
+    expect(error instanceof Error && error.message).toContain("有多个组织");
+    expect(error instanceof Error && error.message).not.toContain("没有组织");
+  }
 });

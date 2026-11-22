@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,11 +13,24 @@ import type { ClockPort, LoggerPort, SecretStorePort } from "../../ports/platfor
 import type { CapyAppPort } from "../../ports/capy-app.ts";
 import { dpapiProtect, dpapiUnprotect } from "../platform/dpapi.ts";
 import { CONTRACT_VERSION, DEVICE_TUNNEL } from "./endpoints.ts";
+import { machineCapabilityOf, refusalFor, shouldWarnFull } from "./machine-capability.ts";
+import type { MachineCapability } from "./machine-capability.ts";
+import { JamRootRegistry, confine, jamIdOf, resolveMachineRoot } from "./machine-path.ts";
 
 const HEADLESS_NAME = "magpie-headless";
 const READY_TIMEOUT_MS = 15_000;
 const CONNECT_POLL_MS = 400;
 const STATE_VERSION = 1;
+
+/** 单文件读取/编辑上限：原来整文件 readFileSync 会 OOM。 */
+const MAX_READ_BYTES = 8 * 1024 * 1024;
+/** 单条隧道流的请求体上限（H-07）。 */
+const MAX_STREAM_BYTES = 32 * 1024 * 1024;
+const MAX_CONCURRENT_STREAMS = 16;
+/** `open` 之后迟迟收不到完整请求体的清理时间。 */
+const STREAM_IDLE_TIMEOUT_MS = 60_000;
+const BASH_OUTPUT_LIMIT = 4 * 1024 * 1024;
+const AUDIT_COMMAND_LIMIT = 200;
 
 function deviceOs(): string {
   if (process.platform === "win32") return "win32";
@@ -45,6 +58,14 @@ export function defaultDeviceName(): string {
     .slice(0, 80) || "capy-headless";
 }
 
+/** 工作区根：显式传入 > MAGPIE_CAPY_WORKTREE_BASE > ~/.capy/worktrees。 */
+export function resolveWorktreeBase(explicit?: string): string {
+  const raw = explicit?.trim() || process.env.MAGPIE_CAPY_WORKTREE_BASE?.trim() || "";
+  if (!raw) return path.join(os.homedir(), ".capy", "worktrees");
+  if (raw.startsWith("~/")) return path.join(os.homedir(), raw.slice(2));
+  return raw;
+}
+
 function stateDir(): string {
   const override = String(process.env.MAGPIE_CAPY_STATE_DIR ?? "").trim();
   if (override) return path.resolve(override);
@@ -59,9 +80,13 @@ function stateDir(): string {
 
 export class FileSecretStore implements SecretStorePort {
   private readonly baseDir: string;
+  private readonly onWarn: ((message: string) => void) | undefined;
+  private prepared = false;
+  private warnedPlaintext = false;
 
-  constructor(baseDir = stateDir()) {
+  constructor(baseDir = stateDir(), options: { readonly onWarn?: (message: string) => void } = {}) {
     this.baseDir = baseDir;
+    this.onWarn = options.onWarn;
   }
 
   async load(account: string): Promise<HeadlessCredential | null> {
@@ -74,7 +99,7 @@ export class FileSecretStore implements SecretStorePort {
       const token = typeof doc.token === "string"
         ? doc.token
         : typeof doc.tokenCiphertext === "string"
-          ? dpapiUnprotect(Buffer.from(doc.tokenCiphertext, "base64")).toString("utf8")
+          ? (await dpapiUnprotect(Buffer.from(doc.tokenCiphertext, "base64"))).toString("utf8")
           : "";
       if (!orgId || !deviceId || !token.startsWith("capyd_")) return null;
       return { orgId, deviceId, name, token };
@@ -84,11 +109,12 @@ export class FileSecretStore implements SecretStorePort {
   }
 
   async save(account: string, credential: HeadlessCredential): Promise<void> {
-    fs.mkdirSync(this.baseDir, { recursive: true });
+    this.prepare();
     const file = this.fileOf(account);
-    const tmp = `${file}.${process.pid}.tmp`;
+    // tmp 名带随机后缀：原来 `${pid}.tmp` 可预测，同机进程可以抢先建同名文件。
+    const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     const secret = process.platform === "win32"
-      ? { tokenCiphertext: dpapiProtect(credential.token) }
+      ? { tokenCiphertext: await dpapiProtect(credential.token) }
       : { token: credential.token };
     fs.writeFileSync(tmp, JSON.stringify({
       version: STATE_VERSION,
@@ -97,14 +123,50 @@ export class FileSecretStore implements SecretStorePort {
       name: credential.name,
       ...secret,
     }, null, 2), { mode: 0o600 });
+    if (process.platform !== "win32") {
+      try { fs.chmodSync(tmp, 0o600); } catch {}
+    }
     fs.renameSync(tmp, file);
     if (process.platform !== "win32") {
       try { fs.chmodSync(file, 0o600); } catch {}
     }
+    this.warnPlaintextOnce(file);
   }
 
   async clear(account: string): Promise<void> {
     try { fs.unlinkSync(this.fileOf(account)); } catch {}
+  }
+
+  /** 目录 0700 + 清掉上次崩溃留下的 `*.tmp`（H-05）。 */
+  private prepare(): void {
+    if (this.prepared) return;
+    this.prepared = true;
+    try { fs.mkdirSync(this.baseDir, { recursive: true, mode: 0o700 }); } catch {}
+    if (process.platform !== "win32") {
+      try { fs.chmodSync(this.baseDir, 0o700); } catch {}
+    }
+    this.cleanupTemps();
+  }
+
+  private cleanupTemps(): void {
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.baseDir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (!name.endsWith(".tmp")) continue;
+      try { fs.unlinkSync(path.join(this.baseDir, name)); } catch {}
+    }
+  }
+
+  private warnPlaintextOnce(file: string): void {
+    if (this.warnedPlaintext || process.platform === "win32") return;
+    this.warnedPlaintext = true;
+    this.onWarn?.(
+      `设备 token 以明文保存在 ${file}（非 Windows 没有 DPAPI；目录 0700、文件 0600 已设置）`,
+    );
   }
 
   private fileOf(account: string): string {
@@ -124,7 +186,10 @@ interface StreamState {
   readonly method: string;
   readonly path: string;
   readonly headers: Record<string, string>;
-  body: Buffer;
+  /** 分块累计；只用一次 `Buffer.concat`（H-07：原来每帧 concat 一次是 O(n²)）。 */
+  readonly chunks: Uint8Array[];
+  bytes: number;
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 function headerValue(headers: Record<string, string>, name: string): string {
@@ -169,26 +234,107 @@ function fileFailure(error: unknown): MachineOutcome {
   return fail("MachineServer.FileError", `other: ${message}`);
 }
 
-function resolveIn(cwd: string, raw: unknown): string {
-  const value = String(raw ?? "").trim();
-  if (!value) throw new Error("path is required");
-  return path.isAbsolute(value) ? path.normalize(value) : path.resolve(cwd, value);
+/** 审计日志：只记命令摘要 + 耗时 + 退出码，**不记 stdout/stderr**（S-02）。 */
+export interface MachineAuditEntry {
+  readonly handler: string;
+  readonly command: string;
+  readonly durationMs: number;
+  readonly exitCode: number;
 }
 
-function sha256(text: string): string {
+/**
+ * machine handler 的运行上下文。
+ * `base` 是工作区根（`~/.capy/worktrees`），`root` 是本 jam 的工作区（默认 = base）。
+ * `worktree_ensure` 的越界检查永远对 `base`，其它 handler 对 `root`。
+ */
+export interface MachineContext {
+  readonly base: string;
+  readonly root: string;
+  readonly capability?: MachineCapability;
+  readonly shell?: string;
+  readonly env?: Record<string, string | undefined>;
+  readonly audit?: (entry: MachineAuditEntry) => void;
+  readonly now?: () => number;
+}
+
+/**
+ * 第三参历史上是 `string`（测试与旧调用点是这么传的），现在既接受字符串也接受
+ * `MachineContext`：字符串按「base = root = 该目录、默认 files 档」归一化。
+ */
+function contextOf(value: string | MachineContext): MachineContext {
+  if (typeof value === "string") {
+    const base = path.resolve(value);
+    return { base, root: base };
+  }
+  const base = path.resolve(value.base);
+  const root = path.resolve(value.root || value.base);
+  return { ...value, base, root };
+}
+
+function sha256OfText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-async function runBash(params: Record<string, unknown>, cwd: string): Promise<MachineOutcome> {
-  const command = String(params.command ?? "");
-  if (!command.trim()) return fail("MachineServer.Bash", "bash command is empty");
-  const timeoutSeconds = Math.max(1, Math.min(600, Number(params.timeoutSeconds) || 120));
-  const runCwd = path.resolve(cwd);
-  try { fs.mkdirSync(runCwd, { recursive: true }); } catch { /* best effort */ }
+/** 流式 hash：大于 8 MB 的文件不再整个读进内存（H-07）。 */
+function sha256OfFile(file: string): string {
+  const hash = createHash("sha256");
+  const fd = fs.openSync(file, "r");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  try {
+    for (;;) {
+      const read = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (read <= 0) break;
+      hash.update(buffer.subarray(0, read));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest("hex");
+}
 
-  const shell = String(process.env.MAGPIE_CAPY_BASH ?? "").trim() || "bash";
-  const env = {
-    ...process.env,
+/**
+ * bash 的环境变量白名单：只透传与定位可执行文件/区域设置有关的键，
+ * 其余（含 `*_KEY` / `*_TOKEN` / 代理 / MAGPIE_CAPY_*）一律不传（S-02）。
+ */
+const BASH_ENV_ALLOW = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "USERNAME",
+  "USERPROFILE",
+  "SHELL",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "SystemRoot",
+  "SystemDrive",
+  "WINDIR",
+  "ComSpec",
+  "PATHEXT",
+  "LOCALAPPDATA",
+  "APPDATA",
+  "PROGRAMDATA",
+  "PROGRAMFILES",
+  "PROGRAMFILES(X86)",
+  "PROGRAMW6432",
+  "PROCESSOR_ARCHITECTURE",
+  "NUMBER_OF_PROCESSORS",
+] as const;
+
+const BASH_ENV_DENY = /(?:key|token|secret|password|passwd|credential|auth|cookie|capy|magpie|proxy|api)/iu;
+
+function bashEnv(source: Record<string, string | undefined>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const name of BASH_ENV_ALLOW) {
+    const value = source[name];
+    if (typeof value === "string" && value && !BASH_ENV_DENY.test(name)) env[name] = value;
+  }
+  return {
+    ...env,
     PS1: "",
     NO_COLOR: "1",
     TERM: "dumb",
@@ -199,8 +345,43 @@ async function runBash(params: Record<string, unknown>, cwd: string): Promise<Ma
     GH_PAGER: "cat",
     COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
   };
-  const startedAt = Date.now();
-  const maxChars = 4 * 1024 * 1024;
+}
+
+function summarizeCommand(command: string): string {
+  const text = command.replace(/\s+/gu, " ").trim();
+  return text.length > AUDIT_COMMAND_LIMIT ? `${text.slice(0, AUDIT_COMMAND_LIMIT)}…` : text;
+}
+
+/** 超时时连子进程组一起杀：只 kill 直接子进程会留下 `npm run` 之类的孙子进程。 */
+function killProcessGroup(child: ReturnType<typeof spawn>, detached: boolean): void {
+  const pid = child.pid;
+  if (detached && typeof pid === "number") {
+    try {
+      process.kill(-pid, "SIGKILL");
+      return;
+    } catch {
+      // 进程组可能已经没了，退化成单进程 kill
+    }
+  }
+  try { child.kill("SIGKILL"); } catch {}
+  if (process.platform === "win32" && pid) {
+    try {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }).unref();
+    } catch {}
+  }
+}
+
+async function runBash(params: Record<string, unknown>, ctx: MachineContext): Promise<MachineOutcome> {
+  const command = String(params.command ?? "");
+  if (!command.trim()) return fail("MachineServer.Bash", "bash command is empty");
+  const timeoutSeconds = Math.max(1, Math.min(600, Number(params.timeoutSeconds) || 120));
+  const runCwd = path.resolve(ctx.root || ctx.base);
+  try { fs.mkdirSync(runCwd, { recursive: true, mode: 0o700 }); } catch { /* best effort */ }
+
+  const shell = String(ctx.shell ?? process.env.MAGPIE_CAPY_BASH ?? "").trim() || "bash";
+  const env = bashEnv(ctx.env ?? process.env);
+  const startedAt = (ctx.now ?? Date.now)();
+  const detached = process.platform !== "win32";
 
   return await new Promise<MachineOutcome>((resolve) => {
     let stdout = "";
@@ -209,23 +390,19 @@ async function runBash(params: Record<string, unknown>, cwd: string): Promise<Ma
     let settled = false;
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(shell, ["-lc", command], { cwd: runCwd, env, windowsHide: true });
+      // `-c` 而不是 `-lc`：不加载 profile（既慢又会把用户的 PATH/alias 带进来）。
+      child = spawn(shell, ["-c", command], { cwd: runCwd, env, windowsHide: true, detached });
     } catch (error) {
       resolve(fail("MachineServer.Bash", `Failed to start bash: ${error instanceof Error ? error.message : String(error)}`));
       return;
     }
     const append = (current: string, chunk: Buffer): string => {
-      if (current.length >= maxChars) return current;
-      return current + chunk.toString("utf8").slice(0, maxChars - current.length);
+      if (current.length >= BASH_OUTPUT_LIMIT) return current;
+      return current + chunk.toString("utf8").slice(0, BASH_OUTPUT_LIMIT - current.length);
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      try { child.kill("SIGKILL"); } catch {}
-      if (process.platform === "win32" && child.pid) {
-        try {
-          spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }).unref();
-        } catch {}
-      }
+      killProcessGroup(child, detached);
     }, timeoutSeconds * 1000);
     timer.unref?.();
     child.stdout?.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
@@ -240,140 +417,227 @@ async function runBash(params: Record<string, unknown>, cwd: string): Promise<Ma
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      const exitCode = typeof code === "number" ? code : -1;
+      const durationMs = (ctx.now ?? Date.now)() - startedAt;
+      try {
+        ctx.audit?.({
+          handler: "bash",
+          command: summarizeCommand(command),
+          durationMs,
+          exitCode,
+        });
+      } catch {
+        // 审计失败不能影响命令结果
+      }
       resolve(ok({
         kind: "bash",
         stdout,
         stderr,
-        exitCode: typeof code === "number" ? code : -1,
-        durationMs: Date.now() - startedAt,
+        exitCode,
+        durationMs,
         timedOut,
-        isError: timedOut,
+        // 非零退出码必须让模型看到失败（原来只有超时才算 error）。
+        isError: timedOut || exitCode !== 0,
         ...(timedOut ? { landingNote: "Command timed out and was stopped." } : {}),
       }));
     });
   });
 }
 
+/** 只有 base 内的目录才能被当作工作区根（S-01：原来用 startsWith 字符串前缀判定）。 */
+function confineOrRefuse(
+  root: string,
+  raw: unknown,
+  options: { readonly mustExist?: boolean; readonly denySymlinkTarget?: boolean } = {},
+): { ok: true; real: string } | MachineOutcome {
+  const confined = confine(root, raw, {
+    ...(options.mustExist ? { mustExist: true } : {}),
+    ...(options.denySymlinkTarget ? { denySymlinkTarget: true } : {}),
+  });
+  if (confined.ok) return { ok: true, real: confined.real };
+  const code = confined.reason === "not found" ? "MachineServer.FileError" : "MachineServer.Refused";
+  return fail(code, confined.reason);
+}
+
+/**
+ * 原子写文件（P3-16）：新建与已存在都走「写同目录临时文件 + rename」，
+ * 不直接覆盖目标。rename 不跟随软链；写前再 lstat 一次，目标是软链就拒。
+ */
+export function writeFileSafely(file: string, content: string): void {
+  const dir = path.dirname(file);
+  const tmp = path.join(dir, `.capy-tmp-${process.pid}-${randomBytes(6).toString("hex")}`);
+  fs.writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600 });
+  try {
+    try {
+      if (fs.lstatSync(file).isSymbolicLink()) {
+        throw Object.assign(new Error("refusing to write through symlink"), { code: "ELOOP" });
+      }
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === "ENOENT") {
+        // 目标不存在，正常新建。
+      } else {
+        throw error;
+      }
+    }
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw error;
+  }
+}
+
+function sizeOf(file: string): number | null {
+  try {
+    return fs.statSync(file).size;
+  } catch {
+    return null;
+  }
+}
+
+/** 按码点截断一行（P3-03）：`String.slice` 会把代理对从中间切开。 */
+function truncateLine(line: string, maxChars: number): string {
+  const points = Array.from(line);
+  return points.length > maxChars
+    ? `${points.slice(0, maxChars).join("")}... (line truncated to ${maxChars} chars)`
+    : line;
+}
+
 export async function machineResult(
   handler: string,
   params: Record<string, unknown>,
-  worktreeBase: string,
+  context: string | MachineContext,
 ): Promise<MachineOutcome> {
+  const ctx = contextOf(context);
+  const capability = ctx.capability ?? "files";
+
+  // 能力分级在最前面：off 不下发任何工具，files 永不执行外部进程（S-02）。
+  const refusal = refusalFor(handler, capability);
+  if (refusal) return fail("MachineServer.Unavailable", refusal);
+
   if (handler === "worktree_ensure") {
-    const root = String(params.root ?? "");
+    const requested = String(params.root ?? "");
+    let root = "";
     let created = false;
-    if (root) {
-      const base = path.resolve(worktreeBase);
-      const resolved = path.resolve(root);
-      if (resolved !== base && !resolved.startsWith(`${base}${path.sep}`)) {
-        return fail("MachineServer.Refused", "worktree root outside worktreeBase");
+    if (requested) {
+      // 例外：永远对 base 校验，而不是 ctx.root。
+      const confined = confineOrRefuse(ctx.base, requested);
+      if ("status" in confined) return confined;
+      root = confined.real;
+      created = !fs.existsSync(root);
+      try {
+        fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+      } catch (error) {
+        return fileFailure(error);
       }
-      created = !fs.existsSync(resolved);
-      fs.mkdirSync(resolved, { recursive: true });
     }
     return ok({ root, created, checkouts: [] });
   }
   if (handler === "worktree_list") {
-    return ok({ kind: "worktree_list", entries: [] });
-  }
-  if (handler === "volume_landed") {
-    const mounts = Array.isArray(params.mounts) ? params.mounts : [];
-    return ok({
-      kind: "volume_landed",
-      mounts: mounts.map((mount) => ({
-        mountPath: String((mount as Record<string, unknown>)?.mountPath ?? ""),
-        current: true,
-      })),
-      landing: false,
-      checkpoints: false,
-      directories: [],
-      unretained: [],
-      handback: true,
-    });
-  }
-  if (handler === "volume_probe") {
-    const mounts = Array.isArray(params.mounts) ? params.mounts : [];
-    return ok({
-      mounts: mounts.map((mount) => ({
-        mountPath: String((mount as Record<string, unknown>)?.mountPath ?? ""),
-        state: "current",
-      })),
-    });
-  }
-  if (handler === "bash") return await runBash(params, worktreeBase);
-  if (handler === "bash_output") return ok({ kind: "not-running" });
-  if (handler === "read") {
+    // 真实现：列 base 下一级目录（原来恒返回空数组 → 模型以为没有工作区）。
+    const entries: { name: string; path: string }[] = [];
     try {
-      const file = resolveIn(worktreeBase, params.path);
-      const text = fs.readFileSync(file, "utf8");
+      for (const item of fs.readdirSync(ctx.base, { withFileTypes: true })) {
+        if (!item.isDirectory()) continue;
+        entries.push({ name: item.name, path: path.join(ctx.base, item.name) });
+      }
+    } catch (error) {
+      return fileFailure(error);
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    return ok({ kind: "worktree_list", entries });
+  }
+  if (handler === "bash") return await runBash(params, ctx);
+  if (handler === "read") {
+    const confined = confineOrRefuse(ctx.root, params.path);
+    if ("status" in confined) return confined;
+    try {
+      const stat = fs.statSync(confined.real);
+      if (stat.isDirectory()) return fail("MachineServer.FileError", `is-directory: ${confined.real}`);
+      if (stat.size > MAX_READ_BYTES) {
+        return ok({ kind: "too-large", sizeBytes: stat.size, bytes: stat.size, isError: true });
+      }
+      const text = fs.readFileSync(confined.real, "utf8");
       const offset = Math.max(1, Number(params.offset) || 1);
       const limit = Math.max(1, Math.min(10_000, Number(params.limit) || 2_000));
       const maxChars = Math.max(200, Math.min(100_000, Number(params.maxChars) || 20_000));
       const all = text.split(/\r?\n/u);
       const content = all
         .slice(offset - 1, offset - 1 + limit)
-        .map((line) => line.length > maxChars ? `${line.slice(0, maxChars)}... (line truncated to ${maxChars} chars)` : line)
+        .map((line) => truncateLine(line, maxChars))
         .join("\n");
-      return ok({ kind: "read", content, offset, totalLines: all.length, isError: false });
+      return ok({ kind: "read", path: confined.real, content, offset, totalLines: all.length, isError: false });
     } catch (error) {
       return fileFailure(error);
     }
   }
   if (handler === "write") {
+    const confined = confineOrRefuse(ctx.root, params.path, { denySymlinkTarget: true });
+    if ("status" in confined) return confined;
     try {
-      const file = resolveIn(worktreeBase, params.path);
       const content = String(params.content ?? "");
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, content, "utf8");
-      return ok({ kind: "write", path: file, bytes: Buffer.byteLength(content), isError: false });
+      fs.mkdirSync(path.dirname(confined.real), { recursive: true, mode: 0o700 });
+      writeFileSafely(confined.real, content);
+      return ok({ kind: "write", path: confined.real, bytes: Buffer.byteLength(content), isError: false });
     } catch (error) {
       return fileFailure(error);
     }
   }
   if (handler === "edit") {
+    const confined = confineOrRefuse(ctx.root, params.path, { mustExist: true, denySymlinkTarget: true });
+    if ("status" in confined) return confined;
     try {
-      const file = resolveIn(worktreeBase, params.path);
       const oldString = String(params.oldString ?? "");
       const newString = String(params.newString ?? "");
       if (!oldString || oldString === newString) {
         return fail("MachineServer.FileError", "oldString must be non-empty and differ from newString");
       }
-      const text = fs.readFileSync(file, "utf8");
+      const size = sizeOf(confined.real) ?? 0;
+      if (size > MAX_READ_BYTES) return fail("MachineServer.FileError", `file too large: ${size} bytes`);
+      const text = fs.readFileSync(confined.real, "utf8");
       const count = text.split(oldString).length - 1;
       if (count === 0) return fail("MachineServer.FileError", `The text was not found in ${String(params.path)}`);
       if (count > 1 && params.replaceAll !== true) {
         return fail("MachineServer.FileError", `Found ${count} occurrences; provide more context or replaceAll`);
       }
-      const next = params.replaceAll === true ? text.split(oldString).join(newString) : text.replace(oldString, newString);
-      fs.writeFileSync(file, next, "utf8");
-      return ok({ kind: "edit", path: file, replacements: count, isError: false });
+      // 两分支统一 split/join：String.replace 会把 $&/$1 当替换模式解释（M-01）。
+      // 到这里 count 只剩 0（已拒绝）或 1（单次）或 replaceAll，全量 join 是安全的。
+      const next = text.split(oldString).join(newString);
+      writeFileSafely(confined.real, next);
+      return ok({ kind: "edit", path: confined.real, replacements: count, isError: false });
     } catch (error) {
       return fileFailure(error);
     }
   }
   if (handler === "file_read") {
+    const confined = confineOrRefuse(ctx.root, params.path);
+    if ("status" in confined) return confined;
+    if (!fs.existsSync(confined.real)) return ok({ kind: "missing", isError: false });
     try {
-      const file = resolveIn(worktreeBase, params.path);
-      const text = fs.readFileSync(file, "utf8");
-      return ok({ kind: "read", path: file, content: { text }, sha: sha256(text), isError: false });
+      const stat = fs.statSync(confined.real);
+      if (stat.size > MAX_READ_BYTES) {
+        return ok({ kind: "too-large", sizeBytes: stat.size, bytes: stat.size, isError: true });
+      }
+      const text = fs.readFileSync(confined.real, "utf8");
+      return ok({ kind: "read", path: confined.real, content: { text }, sha: sha256OfText(text), isError: false });
     } catch (error) {
-      if ((error as { code?: unknown } | null)?.code === "ENOENT") return ok({ kind: "missing", isError: false });
       return fileFailure(error);
     }
   }
   if (handler === "file_write") {
+    const confined = confineOrRefuse(ctx.root, params.path, { denySymlinkTarget: true });
+    if ("status" in confined) return confined;
     try {
-      const file = resolveIn(worktreeBase, params.path);
       const content = String(params.content ?? "");
-      let currentSha: string | null = null;
-      try { currentSha = sha256(fs.readFileSync(file, "utf8")); } catch {}
+      const size = sizeOf(confined.real) ?? 0;
+      if (size > MAX_READ_BYTES) return fail("MachineServer.FileError", `file too large: ${size} bytes`);
+      const currentSha = fs.existsSync(confined.real) ? sha256OfFile(confined.real) : null;
       const baseSha = typeof params.baseSha === "string" ? params.baseSha : null;
       if (baseSha !== null && currentSha !== baseSha) {
         return ok({ kind: "conflict", currentSha, isError: false });
       }
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, content, "utf8");
-      return ok({ kind: "written", sha: sha256(content), bytes: Buffer.byteLength(content), isError: false });
+      fs.mkdirSync(path.dirname(confined.real), { recursive: true, mode: 0o700 });
+      writeFileSafely(confined.real, content);
+      return ok({ kind: "written", sha: sha256OfText(content), bytes: Buffer.byteLength(content), isError: false });
     } catch (error) {
       return fileFailure(error);
     }
@@ -388,18 +652,23 @@ class HeadlessDevice {
   private readonly credential: HeadlessCredential;
   private readonly WebSocketImpl: typeof WebSocket;
   private readonly worktreeBase: string;
+  private readonly capability: MachineCapability;
+  private readonly audit: ((entry: MachineAuditEntry) => void) | undefined;
   private ws: WebSocket | null = null;
   private ready = false;
   private connectPromise: Promise<void> | null = null;
   private readyResolve: (() => void) | null = null;
   private readyReject: ((error: Error) => void) | null = null;
   private readonly streams = new Map<number, StreamState>();
-  private activeRoot: string | null = null;
+  /** jamId → 工作区根；取代原来的进程级 `activeRoot`（H-13(2)）。 */
+  private readonly roots = new JamRootRegistry();
 
   constructor(options: {
     readonly credential: HeadlessCredential;
     readonly WebSocketImpl?: typeof WebSocket;
     readonly worktreeBase?: string;
+    readonly capability?: MachineCapability;
+    readonly audit?: (entry: MachineAuditEntry) => void;
   }) {
     this.credential = options.credential;
     const Impl = options.WebSocketImpl ?? globalThis.WebSocket;
@@ -407,7 +676,9 @@ class HeadlessDevice {
       throw new CapyError("upstream_unavailable", "当前运行时没有 WebSocket（需要 Bun / Node 22+）");
     }
     this.WebSocketImpl = Impl;
-    this.worktreeBase = options.worktreeBase ?? path.join(os.homedir(), ".capy", "worktrees");
+    this.worktreeBase = resolveWorktreeBase(options.worktreeBase);
+    this.capability = options.capability ?? "files";
+    this.audit = options.audit;
   }
 
   get info(): DeviceInfo {
@@ -437,6 +708,12 @@ class HeadlessDevice {
 
   private async connect(timeoutMs: number): Promise<void> {
     this.ready = false;
+    // 先关掉旧 socket 再建新的，避免旧连接的回调干扰新连接（M-15）。
+    const old = this.ws;
+    if (old) {
+      try { old.close(1000, "headless reconnect"); } catch {}
+      this.ws = null;
+    }
     let ws: WebSocket;
     try {
       ws = new this.WebSocketImpl(DEVICE_TUNNEL, {
@@ -452,6 +729,8 @@ class HeadlessDevice {
       this.readyReject = reject;
     });
     const timer = setTimeout(() => {
+      // 旧 socket 的超时不能拒绝新连接的 ready（M-15 身份守卫）。
+      if (this.ws !== ws) return;
       const failure = new Error(`连接 Capy 设备隧道超时（${Math.round(timeoutMs / 1000)}s）`);
       (failure as Error & { code?: string }).code = "device_connect_timeout";
       this.readyReject?.(failure);
@@ -460,19 +739,26 @@ class HeadlessDevice {
     timer.unref?.();
 
     ws.addEventListener("open", () => {
+      if (this.ws !== ws) return;
       this.send({
         type: "hello",
         contractVersion: CONTRACT_VERSION,
         deviceId: this.credential.deviceId,
-        hostname: os.hostname(),
+        // 配对时用生效设备名，hello 也要用同一个名字，否则服务端看到的机器名不一致（P3-06）。
+        hostname: this.credential.name || defaultDeviceName(),
         os: deviceOs(),
         workspaces: [],
         worktreeBase: this.worktreeBase,
         clientVersion: "magpie-headless 1.0",
       });
     });
-    ws.addEventListener("message", (event) => this.onMessage(event));
+    ws.addEventListener("message", (event) => {
+      if (this.ws !== ws) return;
+      this.onMessage(event);
+    });
     ws.addEventListener("close", (event) => {
+      // 旧 socket 的 close 不能置空新连接（M-15 身份守卫）。
+      if (this.ws !== ws) return;
       this.ready = false;
       this.ws = null;
       clearTimeout(timer);
@@ -485,6 +771,7 @@ class HeadlessDevice {
       this.readyReject?.(failure);
     });
     ws.addEventListener("error", () => {
+      if (this.ws !== ws) return;
       const failure = new Error("Capy 设备隧道连接失败");
       (failure as Error & { code?: string }).code = "device_connect_failed";
       this.readyReject?.(failure);
@@ -530,9 +817,19 @@ class HeadlessDevice {
     if (!frame) return;
     const stream = this.streams.get(frame.streamId);
     if (!stream) return;
-    stream.body = Buffer.concat([stream.body, Buffer.from(frame.body)]);
+    stream.chunks.push(frame.body);
+    stream.bytes += frame.body.length;
+    if (stream.bytes > MAX_STREAM_BYTES) {
+      this.dropStream(
+        stream,
+        "MachineServer.Refused",
+        `请求体超过 ${Math.round(MAX_STREAM_BYTES / (1024 * 1024))} MB 上限`,
+      );
+      return;
+    }
     const length = Number(headerValue(stream.headers, "content-length") || 0);
-    if (!length || stream.body.length >= length) this.runStream(stream);
+    // 没有 content-length 时**不能**首帧就开跑：等 `close` 帧。
+    if (length > 0 && stream.bytes >= length) this.runStream(stream);
   }
 
   private onControl(text: string): void {
@@ -544,6 +841,17 @@ class HeadlessDevice {
       return;
     }
     if (type === "session-config") {
+      // 组织不一致就拒绝就绪（M-16）；帧里没带 orgId 时不校验。
+      const frameOrgId = typeof frame.orgId === "string" ? frame.orgId.trim() : "";
+      if (frameOrgId && frameOrgId !== this.credential.orgId) {
+        const failure = new CapyError(
+          "device_pair_failed",
+          `Capy 隧道下发的组织（${frameOrgId}）与配对组织（${this.credential.orgId}）不一致`,
+        );
+        this.readyReject?.(failure);
+        try { this.ws?.close(4003, "org mismatch"); } catch {}
+        return;
+      }
       this.send({ type: "workspaces-changed", workspaces: [] });
       this.send({ type: "ready" });
       this.readyResolve?.();
@@ -552,7 +860,14 @@ class HeadlessDevice {
     if (type === "open") {
       const streamId = Number(frame.streamId);
       if (!Number.isInteger(streamId)) return;
-      this.streams.set(streamId, {
+      if (this.streams.size >= MAX_CONCURRENT_STREAMS) {
+        this.respond(streamId, 200, fail(
+          "MachineServer.Refused",
+          `并发流超过 ${MAX_CONCURRENT_STREAMS} 上限`,
+        ));
+        return;
+      }
+      const stream: StreamState = {
         streamId,
         kind: String(frame.kind ?? "invoke"),
         method: String(frame.method ?? "POST"),
@@ -560,8 +875,19 @@ class HeadlessDevice {
         headers: (frame.headers && typeof frame.headers === "object"
           ? frame.headers as Record<string, string>
           : {}),
-        body: Buffer.alloc(0),
-      });
+        chunks: [],
+        bytes: 0,
+        timer: null,
+      };
+      stream.timer = setTimeout(() => {
+        // open 之后 60s 没拿到完整请求体 → 清掉并明确失败，避免泄漏一个占位的流。
+        const current = this.streams.get(streamId);
+        if (current === stream) {
+          this.dropStream(stream, "MachineServer.Timeout", "60s 内没有收到完整请求体");
+        }
+      }, STREAM_IDLE_TIMEOUT_MS);
+      stream.timer.unref?.();
+      this.streams.set(streamId, stream);
       return;
     }
     if (type === "close") {
@@ -571,7 +897,21 @@ class HeadlessDevice {
     }
   }
 
+  private releaseStream(stream: StreamState): void {
+    if (stream.timer) {
+      clearTimeout(stream.timer);
+      stream.timer = null;
+    }
+    this.streams.delete(stream.streamId);
+  }
+
+  private dropStream(stream: StreamState, code: string, message: string): void {
+    this.releaseStream(stream);
+    this.respond(stream.streamId, 200, fail(code, message));
+  }
+
   private runStream(stream: StreamState): void {
+    this.releaseStream(stream);
     void this.handleStream(stream).catch((error) => {
       this.respond(stream.streamId, 200, {
         status: "failed",
@@ -581,22 +921,34 @@ class HeadlessDevice {
   }
 
   private async handleStream(stream: StreamState): Promise<void> {
-    this.streams.delete(stream.streamId);
+    // 一次性 concat，之后不再持有分块数组。
+    const body = stream.chunks.length > 0
+      ? Buffer.concat(stream.chunks, stream.bytes)
+      : Buffer.alloc(0);
     let payload: unknown = null;
-    try { payload = stream.body.length > 0 ? JSON.parse(stream.body.toString("utf8")) : null; } catch {}
+    try { payload = body.length > 0 ? JSON.parse(body.toString("utf8")) : null; } catch {}
     const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
     let result: MachineOutcome;
     if (stream.path.startsWith("/v1/git/capture")) {
+      // 占位：README 已标注未实现，这里返回空列表而不是假成功。
       result = ok({ repos: [] });
     } else if (stream.path.startsWith("/v1/invocations")) {
       const handler = String(record.handler ?? "");
       const params = record.params && typeof record.params === "object"
         ? record.params as Record<string, unknown>
         : {};
-      result = await machineResult(handler, params, this.activeRoot ?? this.worktreeBase);
+      // 每个请求按自己的 jamId 取工作区根；没有 jamId 才退回 base。
+      const root = resolveMachineRoot(stream.headers, this.worktreeBase, this.roots);
+      result = await machineResult(handler, params, {
+        base: this.worktreeBase,
+        root,
+        capability: this.capability,
+        ...(this.audit ? { audit: this.audit } : {}),
+      });
       if (handler === "worktree_ensure" && result.status === "succeeded") {
-        const root = String(params.root ?? "");
-        if (root) this.activeRoot = root;
+        const created = (result.result as { root?: unknown } | null)?.root;
+        const jamId = jamIdOf(stream.headers);
+        if (jamId && typeof created === "string" && created) this.roots.set(jamId, created);
       }
     } else {
       result = fail("MachineServer.Unavailable", `未实现的路径 ${stream.path}`);
@@ -639,6 +991,8 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
   private readonly clock: ClockPort;
   private readonly logger: LoggerPort | undefined;
   private readonly deviceName: string;
+  /** 能力分级在构造时算一次（`MAGPIE_CAPY_MACHINE_TOOLS`），运行期不变。 */
+  private readonly capability: MachineCapability;
   private readonly devices = new Map<string, HeadlessDevice>();
   private readonly inflight = new Map<string, Promise<DeviceInfo>>();
 
@@ -648,12 +1002,19 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
     readonly clock: ClockPort;
     readonly logger?: LoggerPort;
     readonly deviceName?: string;
+    readonly env?: Record<string, string | undefined>;
   }) {
     this.app = options.app;
     this.store = options.store;
     this.clock = options.clock;
     this.logger = options.logger;
     this.deviceName = options.deviceName?.trim() || defaultDeviceName();
+    this.capability = machineCapabilityOf(options.env ?? process.env, (message) => {
+      this.logger?.warn(message);
+    });
+    if (shouldWarnFull(this.capability)) {
+      this.logger?.warn("MAGPIE_CAPY_MACHINE_TOOLS=full：设备会执行远端下发的任意 shell 命令");
+    }
   }
 
   async ensure(session: AccountSession, signal?: AbortSignal): Promise<DeviceInfo> {
@@ -667,6 +1028,13 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
     } finally {
       this.inflight.delete(key);
     }
+  }
+
+  /** 只读快照：不配对、不建连、不发网络请求（H-14(5)）。 */
+  peek(session: AccountSession): DeviceInfo {
+    const hit = this.devices.get(accountKey(session));
+    if (hit) return hit.info;
+    return { id: "", name: this.deviceName, connected: false };
   }
 
   close(): void {
@@ -690,7 +1058,9 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
     const jwt = await this.app.sessionJwt(session.clerk, signal);
     let credential = await this.store.load(key);
     if (!credential || credential.orgId !== session.orgId) {
+      const oldDeviceId = credential?.deviceId;
       credential = await this.pair(session, jwt, signal);
+      this.noteReplacedDevice(oldDeviceId, credential.deviceId);
     } else if (credential.name !== this.deviceName) {
       try {
         await this.app.renameDevice(jwt, session.orgId, credential.deviceId, this.deviceName, signal);
@@ -709,7 +1079,9 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
       device = await this.connect(credential, signal);
     } catch (error) {
       if (!tokenRejected(error)) throw error;
+      const oldDeviceId = credential.deviceId;
       credential = await this.pair(session, jwt, signal);
+      this.noteReplacedDevice(oldDeviceId, credential.deviceId);
       device = await this.connect(credential, signal);
     }
     const connected = await this.waitConnected(jwt, session.orgId, credential.deviceId, signal);
@@ -721,6 +1093,12 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
     return { id: credential.deviceId, name: credential.name, connected: true };
   }
 
+  /** 重配对会留下旧设备（上游无删除接口）：打一条 warn，提示用户手动删除。 */
+  private noteReplacedDevice(oldDeviceId: string | undefined, newDeviceId: string): void {
+    if (!oldDeviceId || oldDeviceId === newDeviceId) return;
+    this.logger?.warn("capy device replaced; delete the old device manually", { oldDeviceId, deviceId: newDeviceId });
+  }
+
   private infoOf(device: HeadlessDevice): DeviceInfo {
     return device.info;
   }
@@ -728,7 +1106,11 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
   private async connect(credential: HeadlessCredential, signal?: AbortSignal): Promise<HeadlessDevice> {
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
-      const device = new HeadlessDevice({ credential });
+      const device = new HeadlessDevice({
+        credential,
+        capability: this.capability,
+        ...(this.logger ? { audit: (entry) => this.logger?.event("machine_audit", { ...entry }) } : {}),
+      });
       try {
         await device.ensure();
         return device;
@@ -751,7 +1133,7 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
 
   private async pair(session: AccountSession, jwt: string, signal?: AbortSignal): Promise<HeadlessCredential> {
     const start = await this.app.startDeviceCode(jwt, {
-      hostname: os.hostname(),
+      hostname: this.deviceName,
       os: deviceOs(),
       arch: deviceArch(),
     }, signal);
@@ -771,6 +1153,13 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
         continue;
       }
       if (poll.status === "approved") {
+        // 配对到了另一个组织就报错，不静默用对方的 orgId（M-16）。
+        if (poll.enrolled.orgId && poll.enrolled.orgId !== session.orgId) {
+          throw new CapyError(
+            "device_pair_failed",
+            `Capy 设备码配对到了另一个组织（${poll.enrolled.orgId}），与当前登录组织（${session.orgId}）不一致`,
+          );
+        }
         const credential: HeadlessCredential = {
           orgId: poll.enrolled.orgId || session.orgId,
           deviceId: poll.enrolled.deviceId,

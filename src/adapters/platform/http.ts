@@ -18,6 +18,11 @@ export interface Retry429Options {
   readonly maxRetries?: number;
   /** 等待函数，默认 setTimeout 实现；测试可注入 fake。 */
   readonly sleep?: SleepFn;
+  /**
+   * 单次尝试的超时（毫秒）；不设则尝试不限时。
+   * 重试等待不受该超时约束（H-10：总 timer 不再吞掉 429 重试等待）。
+   */
+  readonly attemptTimeoutMs?: number;
 }
 
 /** 解析 Retry-After（秒数或 HTTP 日期）→ 毫秒；缺失/无效返回 null。 */
@@ -66,9 +71,37 @@ export async function defaultSleep(ms: number, signal?: AbortSignal): Promise<vo
 }
 
 /**
+ * 单次尝试：每次调用都用独立 AbortController，超时只掐这一次尝试，
+ * 调用方取消时立即转发。返回的 signal 属于这次尝试。
+ */
+function attemptSignal(
+  outerSignal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (timeoutMs !== undefined) {
+    timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+  }
+  const onOuterAbort = () => controller.abort(outerSignal?.reason);
+  if (outerSignal) {
+    if (outerSignal.aborted) controller.abort(outerSignal.reason);
+    else outerSignal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      if (timer !== undefined) clearTimeout(timer);
+      outerSignal?.removeEventListener("abort", onOuterAbort);
+    },
+  };
+}
+
+/**
  * 只针对 HTTP 429 的有界重试：每次 429 且还有重试次数时，按 Retry-After
  *（没有则 1s/2s 退避）等待后重发。其它状态直接返回，不重试。
  * fetch 本身抛错（网络/取消）直接透传，由调用方映射。
+ * attemptTimeoutMs 只约束单次 fetch，不约束重试等待（H-10）。
  */
 export async function fetchWith429Retry(
   fetchImpl: typeof fetch,
@@ -78,15 +111,55 @@ export async function fetchWith429Retry(
 ): Promise<Response> {
   const maxRetries = options.maxRetries ?? MAX_429_RETRIES;
   const sleep = options.sleep ?? defaultSleep;
+  const outerSignal = init.signal ?? undefined;
   let attempt = 0;
   for (;;) {
-    const response = await fetchImpl(url, init);
+    const { signal, cleanup } = attemptSignal(outerSignal, options.attemptTimeoutMs);
+    let response: Response;
+    try {
+      response = await fetchImpl(url, { ...init, signal });
+    } finally {
+      cleanup();
+    }
     if (response.status !== 429 || attempt >= maxRetries) return response;
     const delay = retryDelayMs(response.headers, attempt + 1);
     attempt += 1;
     // 读掉/取消 429 响应体，避免连接泄漏
     await response.body?.cancel().catch(() => {});
-    await sleep(delay, init.signal ?? undefined);
+    await sleep(delay, outerSignal);
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException
+    && (error.name === "AbortError" || error.name === "TimeoutError");
+}
+
+/** 读响应体：同样受 timeoutMs 约束（M-10：text() 不能在超时保护之外挂住）。 */
+async function readTextWithTimeout(
+  response: Response,
+  timeoutMs: number,
+  outerSignal: AbortSignal | undefined,
+): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectAbort: ((error: unknown) => void) | undefined;
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+    timer = setTimeout(
+      () => reject(new DOMException("Aborted", "AbortError")),
+      Math.max(1, timeoutMs),
+    );
+  });
+  const onOuterAbort = () => rejectAbort?.(new DOMException("Aborted", "AbortError"));
+  if (outerSignal) {
+    if (outerSignal.aborted) rejectAbort?.(new DOMException("Aborted", "AbortError"));
+    else outerSignal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  try {
+    return await Promise.race([response.text(), abortPromise]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    outerSignal?.removeEventListener("abort", onOuterAbort);
   }
 }
 
@@ -97,34 +170,37 @@ export async function requestJson(
   timeoutMs = 30_000,
   retry?: Retry429Options,
 ): Promise<JsonResponse> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
-  const signal = init.signal;
-  const onAbort = () => controller.abort();
-  if (signal) {
-    if (signal.aborted) controller.abort();
-    else signal.addEventListener("abort", onAbort, { once: true });
-  }
+  const outerSignal = init.signal ?? undefined;
   try {
     let response: Response;
-    try {
-      response = retry
-        ? await fetchWith429Retry(fetchImpl, url, { ...init, signal: controller.signal }, retry)
-        : await fetchImpl(url, { ...init, signal: controller.signal });
-    } catch (error) {
-      if (controller.signal.aborted && !signal?.aborted) {
-        throw new CapyError("upstream_timeout", "连接 Capy 超时，请检查网络/代理后重试", { cause: error });
+    if (retry) {
+      response = await fetchWith429Retry(fetchImpl, url, init, {
+        ...retry,
+        attemptTimeoutMs: timeoutMs,
+      });
+    } else {
+      const { signal, cleanup } = attemptSignal(outerSignal, timeoutMs);
+      try {
+        response = await fetchImpl(url, { ...init, signal });
+      } finally {
+        cleanup();
       }
-      throw new CapyError("upstream_unavailable", `连接 Capy 失败：${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
-    const text = await response.text();
+    // text() 在同一个 try 里：读体中途超时/取消也映射，不再挂在保护之外（M-10）。
+    const text = await readTextWithTimeout(response, timeoutMs, outerSignal);
     let body: unknown = null;
     if (text) {
       try { body = JSON.parse(text); } catch { body = null; }
     }
     return { response, body, text };
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
+  } catch (error) {
+    if (isAbortError(error)) {
+      if (outerSignal?.aborted) {
+        // 调用方主动取消：不是上游超时。
+        throw new CapyError("upstream_unavailable", `连接 Capy 失败：${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      }
+      throw new CapyError("upstream_timeout", "连接 Capy 超时，请检查网络/代理后重试", { cause: error });
+    }
+    throw new CapyError("upstream_unavailable", `连接 Capy 失败：${error instanceof Error ? error.message : String(error)}`, { cause: error });
   }
 }

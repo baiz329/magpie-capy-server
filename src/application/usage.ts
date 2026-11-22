@@ -2,6 +2,7 @@ import { isAuthError } from "../domain/errors.ts";
 import type { Balance, UsageSnapshot, UsageTotals, UsageWindow } from "../domain/usage.ts";
 import type { CapyPublicPort } from "../ports/capy-public.ts";
 import type { CachePort } from "../ports/platform.ts";
+import { keyHash } from "./key-hash.ts";
 
 export interface UsageUseCaseOptions {
   readonly publicApi: CapyPublicPort;
@@ -19,7 +20,8 @@ export class UsageUseCase {
   }
 
   async load(apiKey: string, signal?: AbortSignal): Promise<UsageSnapshot> {
-    const key = `usage:${apiKey.slice(-16)}`;
+    // 缓存键用密钥哈希，不用 apiKey 尾部（M-05）。
+    const key = `usage:${await keyHash(apiKey)}`;
     const hit = this.options.cache?.get<UsageSnapshot>(key);
     if (hit) return hit;
     try {
@@ -60,12 +62,12 @@ export function buildUsage(usage: UsageTotals, balance: Balance): UsageSnapshot 
       ...(resetsAt ? { resetsAt } : {}),
     });
   } else {
-    // 这是 Magpie 的路由策略：余额未知/为零时用 used=100 让账号沉底，
-    // 不是 Capy API 返回的字段。
+    // 余额未知：与"已用尽"区分开。used=100 是 Magpie 的路由策略——
+    // 余额未知/为零时让账号沉底，不是 Capy API 返回的字段。
     windows.push({
       name: "余额",
       used: 100,
-      display: "无可用余额 / 未订阅",
+      display: "余额未知",
       ...(resetsAt ? { resetsAt } : {}),
     });
   }
@@ -93,7 +95,7 @@ export function withDeviceWindow(snapshot: UsageSnapshot, device: { connected: b
         aside: true,
         display: device.connected
           ? `已连接${device.name ? ` · ${device.name}` : ""}`
-          : "未连接（自动注册失败，看插件日志）",
+          : "未连接（点击对话后自动连接）",
       },
     ],
   };
@@ -101,7 +103,13 @@ export function withDeviceWindow(snapshot: UsageSnapshot, device: { connected: b
 
 export function money(value: number, currency = "USD"): string {
   const symbol = currency === "USD" ? "$" : `${currency} `;
-  return `${symbol}${value.toFixed(value >= 100 ? 0 : 2)}`;
+  if (!Number.isFinite(value)) return `${symbol}0`;
+  // 负号放货币符号前面（-$5.25，不是 $-5.25）；整数不补小数，
+  // 有小数时保留两位（>=100 也不丢小数）。
+  const sign = value < 0 ? "-" : "";
+  const abs = Math.abs(value);
+  const body = Number.isInteger(abs) ? String(abs) : abs.toFixed(2);
+  return `${sign}${symbol}${body}`;
 }
 
 function tokensText(tokens: UsageTotals["tokens"]): string {

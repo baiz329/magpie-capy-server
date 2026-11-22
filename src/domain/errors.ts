@@ -40,11 +40,13 @@ export class CapyError extends Error {
   readonly status: number;
   readonly retryable: boolean;
   readonly detail: string | undefined;
+  /** 仅 429 使用：上游建议的等待时间（毫秒）。入口层据此补 `retry-after` 头。 */
+  readonly retryAfterMs: number | undefined;
 
   constructor(
     kind: ErrorKind,
     message: string,
-    options: { status?: number; retryable?: boolean; detail?: string; cause?: unknown } = {},
+    options: { status?: number; retryable?: boolean; detail?: string; cause?: unknown; retryAfterMs?: number } = {},
   ) {
     super(message, { cause: options.cause });
     this.name = "CapyError";
@@ -52,6 +54,7 @@ export class CapyError extends Error {
     this.status = options.status ?? STATUS[kind];
     this.retryable = options.retryable ?? RETRYABLE.has(kind);
     this.detail = options.detail;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 
@@ -63,9 +66,10 @@ export function isAuthError(value: unknown): boolean {
   return isCapyError(value) && value.kind === "sign_in_required";
 }
 
-/** 上游 JSON / HTTP 状态 → 领域错误。 */
-export function mapUpstream(status: number, body: unknown, fallback = ""): CapyError {
+/** 上游 JSON / HTTP 状态 → 领域错误。retryAfterMs 由调用方从响应头传入（429 才用）。 */
+export function mapUpstream(status: number, body: unknown, fallback = "", retryAfterMs?: number | null): CapyError {
   const tag = tagOf(body);
+  const code = codeOf(body);
   const message = messageOf(body) || fallback || `Capy upstream error (HTTP ${status})`;
 
   if (status === 401 || tag === "capy/Unauthorized") {
@@ -75,10 +79,19 @@ export function mapUpstream(status: number, body: unknown, fallback = ""): CapyE
     return new CapyError("insufficient_quota", message || "Capy 额度不足", { detail: tag });
   }
   if (status === 403 || tag === "capy/Forbidden") {
+    // 403 的 region 码不能只靠 SSE/jam 事件码路径：HTTP body 里带了也要认（M-14）。
+    if (/region_unsupported|RegionUnsupported/iu.test(`${tag} ${code} ${message}`)) {
+      return new CapyError("region_unsupported", message || "Capy 在当前地区不可用", { detail: code || tag });
+    }
     return new CapyError("upstream_error", message || "Capy 拒绝了这个请求", { status: 403, detail: tag });
   }
   if (status === 429 || tag === "capy/RateLimited") {
-    return new CapyError("rate_limited", message || "Capy 限流", { detail: tag });
+    return new CapyError("rate_limited", message || "Capy 限流", {
+      detail: tag,
+      ...(typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs >= 0
+        ? { retryAfterMs }
+        : {}),
+    });
   }
   if (status === 404 || tag.endsWith("NotFound")) {
     // 只有模型选择相关的 404 才是 model_not_found；线程/设备/项目 404 是资源不存在。
@@ -104,6 +117,24 @@ function tagOf(body: unknown): string {
   if (!body || typeof body !== "object") return "";
   const tag = (body as { _tag?: unknown })._tag;
   return typeof tag === "string" ? tag : "";
+}
+
+/** 上游 body 里的 `code` 字段（如 `region_unsupported`），与 `_tag` 互补。 */
+function codeOf(body: unknown): string {
+  if (!body || typeof body !== "object") return "";
+  const record = body as { code?: unknown; error?: { code?: unknown } };
+  if (typeof record.code === "string") return record.code;
+  const nested = record.error;
+  if (nested && typeof nested === "object" && typeof nested.code === "string") return nested.code;
+  return "";
+}
+
+/** 429 的 `retry-after` 秒数（向上取整）；无建议值时返回 null。 */
+export function retryAfterSeconds(error: unknown): number | null {
+  if (!isCapyError(error)) return null;
+  const ms = error.retryAfterMs;
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return null;
+  return Math.ceil(ms / 1000);
 }
 
 function messageOf(body: unknown): string {

@@ -1,7 +1,7 @@
 {
   "name": "magpie-capy",
-  "version": "0.3.0",
-  "description": "Capy provider plugin for Magpie v0.2: headless device, three login methods including two-box Cookie login, native SSE, image/PDF attachments, zero runtime dependencies.",
+  "version": "0.3.1",
+  "description": "Capy provider plugin for Magpie: headless device, three login methods including two-box Cookie login, native SSE, image/PDF attachments, zero npm runtime dependencies (bash/PowerShell also needed for machine tools).",
   "type": "module",
   "main": "dist/index.mjs",
   "exports": "./dist/index.mjs",
@@ -20,7 +20,7 @@
     "bun": ">=1.4.0"
   },
   "devDependencies": {
-    "@types/bun": "latest",
+    "@types/bun": "^1.4.4",
     "typescript": "^5.9.0"
   },
   "keywords": [

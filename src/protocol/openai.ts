@@ -5,13 +5,15 @@ import type {
   ToolCall,
   ToolDefinition,
 } from "../domain/chat.ts";
-import { CapyError, toOpenAiError } from "../domain/errors.ts";
+import { CapyError, retryAfterSeconds, toOpenAiError } from "../domain/errors.ts";
 import type { ChatEvent } from "../domain/chat.ts";
 
 export function parseChatRequest(body: unknown): ChatRequest {
   if (!isRecord(body)) throw invalid("请求体必须是 JSON 对象");
   const messagesRaw = body.messages;
   if (!Array.isArray(messagesRaw) || messagesRaw.length === 0) throw invalid("messages 为空");
+  // messages 数上限 200（P3-09）：超限直接拒，不静默截断。
+  if (messagesRaw.length > 200) throw invalid("messages 最多 200 条");
   const messages = messagesRaw.map(parseMessage);
 
   const model = typeof body.model === "string" ? body.model.trim() : "";
@@ -27,7 +29,8 @@ export function parseChatRequest(body: unknown): ChatRequest {
   return {
     model,
     messages,
-    stream: body.stream === true,
+    // stream 宽松转换："true"/1/"1" 都认（P3-09）。
+    stream: body.stream === true || body.stream === 1 || body.stream === "1" || body.stream === "true",
     ...(reasoningEffort ? { reasoningEffort } : {}),
     ...(Array.isArray(body.tools) ? { tools: body.tools.map(parseTool) } : {}),
     ...(body.tool_choice === undefined ? {} : { toolChoice: body.tool_choice }),
@@ -270,11 +273,14 @@ export function encodeCompletion(id: string, model: string, created: number, tex
 
 export function encodeErrorResponse(error: unknown): Response {
   const body = toOpenAiError(error);
+  const retryAfter = retryAfterSeconds(error);
   return new Response(JSON.stringify(body), {
     status: body.error.status,
     headers: {
       "content-type": "application/json; charset=utf-8",
       ...(body.error.status === 401 ? { "x-magpie-sign-in": "expired" } : {}),
+      // 只在上游给过 Retry-After 时才发（H-10/M-14）：没有建议值就不发假头。
+      ...(body.error.status === 429 && retryAfter !== null ? { "retry-after": String(retryAfter) } : {}),
     },
   });
 }
@@ -298,56 +304,113 @@ export function encodeModelList(models: readonly { id: string; name: string }[],
   }), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
 }
 
-/** 把 ChatEvent 流编码成 OpenAI SSE Response。 */
+/**
+ * 把 ChatEvent 流编码成 OpenAI SSE Response（M-11）。
+ *
+ * `pull()` 逐事件拉取 → 天然背压；`cancel()` 调 onCancel + `iterator.return()`，
+ * `closed` 单标志保证：永不 close 后再 enqueue、永不出现两个 `[DONE]`。
+ * 首个 role chunk 只在消费到第一个内容事件后才发，不在消费任何事件前无条件 push。
+ */
 export function encodeChatStream(
   events: AsyncIterable<ChatEvent>,
   meta: ChunkMeta,
   usage?: ChatStreamUsage,
+  onCancel?: (reason: unknown) => void,
 ): Response {
   const encoder = new TextEncoder();
+  const iterator = events[Symbol.asyncIterator]();
+  let closed = false;
+  let roleSent = false;
+  let emitted = false;
+  let text = "";
+
   const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const push = (text: string) => controller.enqueue(encoder.encode(text));
-      const pushUsage = (completionText: string) => {
-        if (!usage) return;
-        push(encodeUsageChunk(meta, {
-          promptTokens: usage.promptTokens,
-          completionTokens: usage.estimateCompletionTokens(completionText),
-        }));
+    async pull(controller) {
+      if (closed) return;
+      const push = (chunk: string) => {
+        if (closed) return;
+        controller.enqueue(encoder.encode(chunk));
       };
-      push(encodeChunk(meta, { role: "assistant", content: "" }));
-      let emitted = false;
-      let text = "";
-      try {
-        for await (const event of events) {
-          if (event.type === "delta") {
+      const sendRole = () => {
+        if (roleSent) return;
+        roleSent = true;
+        push(encodeChunk(meta, { role: "assistant", content: "" }));
+      };
+      const finish = () => {
+        if (closed) return;
+        push(encodeChunk(meta, {}, "stop"));
+        if (usage) {
+          push(encodeUsageChunk(meta, {
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.estimateCompletionTokens(text),
+          }));
+        }
+        push(SSE_DONE);
+        closed = true;
+        controller.close();
+      };
+      const fail = (error: unknown) => {
+        if (closed) return;
+        push(encodeSseError(error));
+        closed = true;
+        controller.close();
+      };
+
+      for (;;) {
+        if (closed) return;
+        let step: IteratorResult<ChatEvent>;
+        try {
+          step = await iterator.next();
+        } catch (error) {
+          fail(error);
+          return;
+        }
+        if (closed) return;
+        if (step.done) {
+          // 生成器正常结束但没有 done 事件：按"缺 done"收尾，不发假 stop。
+          fail(new CapyError("upstream_unavailable", "上游流在完成前中断"));
+          return;
+        }
+        const event = step.value;
+        if (event.type === "delta") {
+          sendRole();
+          emitted = true;
+          text += event.text;
+          push(encodeContentDelta(meta, event.text));
+          return; // 一次 pull 只吐一块
+        }
+        if (event.type === "final") {
+          if (!emitted && event.text) {
+            sendRole();
             emitted = true;
-            text += event.text;
+            text = event.text;
             push(encodeContentDelta(meta, event.text));
-          } else if (event.type === "error") {
-            push(encodeSseError(event.error));
-            controller.close();
-            return;
-          } else if (event.type === "final") {
-            if (!emitted && event.text) {
-              text = event.text;
-              push(encodeContentDelta(meta, event.text));
-            }
-          } else if (event.type === "done") {
-            push(encodeChunk(meta, {}, "stop"));
-            pushUsage(text);
-            push(SSE_DONE);
-            controller.close();
             return;
           }
+          continue;
         }
-        push(encodeChunk(meta, {}, "stop"));
-        pushUsage(text);
-        push(SSE_DONE);
-        controller.close();
-      } catch (error) {
-        push(encodeSseError(error));
-        controller.close();
+        if (event.type === "error") {
+          fail(event.error);
+          return;
+        }
+        if (event.type === "done") {
+          finish();
+          return;
+        }
+      }
+    },
+    async cancel(reason) {
+      if (closed) return;
+      closed = true; // 先立标记：之后任何 push 都丢弃
+      try {
+        onCancel?.(reason);
+      } catch {
+        // 取消回调不能影响清理
+      }
+      try {
+        await iterator.return?.(undefined);
+      } catch {
+        // 上游已结束/不可关闭
       }
     },
   });

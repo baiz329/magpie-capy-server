@@ -14,6 +14,8 @@ export interface AccountSession {
   readonly clerk: ClerkSession;
   readonly source: LoginSource;
   readonly displayName?: string;
+  /** 上游 mint API key 时返回的 keyId（有则记录，供清理时辨认）。 */
+  readonly apiKeyId?: string;
 }
 
 export function accountKey(session: Pick<AccountSession, "accountId" | "uid" | "orgId">): string {

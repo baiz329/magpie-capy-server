@@ -96,6 +96,35 @@ test("probe：探测超时时回退到 0.9.2，不挂住请求", async () => {
   expect(await probe.currentVersion()).toBe(FALLBACK_DESKTOP_VERSION);
 });
 
+test("probe：探测失败写 5 分钟负缓存，期间不再请求，失败 warn 只打一次", async () => {
+  let now = 0;
+  let calls = 0;
+  const warns: string[] = [];
+  const fetchImpl = (async (): Promise<Response> => {
+    calls += 1;
+    throw new Error("network down");
+  }) as unknown as typeof fetch;
+  const probe = createDesktopVersionProbe({ fetchImpl, now: () => now, onWarn: (m) => warns.push(m) });
+  expect(await probe.currentVersion()).toBe(FALLBACK_DESKTOP_VERSION);
+  expect(await probe.currentVersion()).toBe(FALLBACK_DESKTOP_VERSION);
+  expect(calls).toBe(1);
+  expect(warns.length).toBe(1);
+  // 负缓存期内仍不请求
+  now = 4 * 60_000;
+  expect(await probe.currentVersion()).toBe(FALLBACK_DESKTOP_VERSION);
+  expect(calls).toBe(1);
+  expect(warns.length).toBe(1);
+  // 5 分钟后重新探测
+  now = 5 * 60_000 + 1;
+  expect(await probe.currentVersion()).toBe(FALLBACK_DESKTOP_VERSION);
+  expect(calls).toBe(2);
+});
+
+test("probe：默认单次超时 1.5s", async () => {
+  const { DEFAULT_VERSION_TIMEOUT_MS } = await import("../../src/adapters/capy/client-version.ts");
+  expect(DEFAULT_VERSION_TIMEOUT_MS).toBe(1500);
+});
+
 test("接线：CapyAppClient 用探测到的版本拼 UA 发请求", async () => {
   const { CapyAppClient } = await import("../../src/adapters/capy/app-client.ts");
   let sentUa = "";
