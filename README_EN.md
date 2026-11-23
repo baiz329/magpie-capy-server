@@ -4,12 +4,19 @@
 
 A magpie provider plugin that connects [Capy](https://capy.ai) to [magpie](https://usemagpie.ai). Forked from [baijiu666/magpie-Capy](https://github.com/baijiu666/magpie-Capy), with Cookie login added for headless Linux servers: no desktop app, no graphical browser — paste two pieces of Cookie and sign in. 62 models in the upstream catalog + 2 in-app ADS models = 64 in total (snapshot, may change), 3 of them free; native SSE streaming / non-streaming chat, image / PDF attachments.
 
-Current version: **v0.3.1** (git tag `v0.3.1`; not published to npm).
+> ⚠️ **Warning: the author's Capy account has been banned.**
+>
+> The plugin already includes anti-detection alignment (requests sent exactly like the real desktop client, User-Agent version freshness, and more), and the author's account was still banned. Anti-detection measures only lower the chance of being flagged — they cannot guarantee you won't be banned.
+>
+> **Use a throwaway / secondary account only — never your main account.** This applies doubly to paid accounts.
+
+Current version: **v0.3.2** (git tag `v0.3.2`; not published to npm).
 
 Note: the same-named package `magpie-capy` on npm (grokboot) is unrelated to this project; this project is not published to npm.
 
 ## Navigation
 
+- [What's new in v0.3.2](#whats-new-in-v032)
 - [What's new in v0.3.1](#whats-new-in-v031)
 - [What's new in v0.3](#whats-new-in-v03)
 - [Features](#features)
@@ -25,6 +32,15 @@ Note: the same-named package `magpie-capy` on npm (grokboot) is unrelated to thi
 - [Headless device & tools](#headless-device--tools)
 - [Scope](#scope)
 - [License](#license)
+
+## What's new in v0.3.2
+
+A safety-warning release, no functional changes:
+
+- A prominent warning is now at the top of README / README_EN: the author's Capy account has been banned; the plugin already includes anti-detection alignment (desktop-client request alignment, UA freshness, and more) and was still banned; use a throwaway / secondary account only, never your main account.
+- The Risk warning section now notes the author's account ban as well.
+
+Full list in [CHANGELOG.md](./CHANGELOG.md).
 
 ## What's new in v0.3.1
 
@@ -136,6 +152,8 @@ The two ADS models are gated by Capy on **exit IP** — request headers can't by
 
 ## Risk warning
 
+> 2026-11-23: the author's Capy account has been banned (see the warning at the top). Anti-detection measures do not guarantee you won't be banned.
+>
 > This plugin calls Capy's website chat API directly with your own Clerk session (a reverse-engineered implementation, not Capy's official API). Free and paid models all go through the same interface (the model is just a parameter); there is no separate official API chat channel. The API key the plugin mints automatically is only used to fetch the model list, receive streamed messages, upload attachments, and check usage — not to call models directly. Every call creates a real new conversation in your Capy account. Request formats are highly uniform and behavior differs from normal web usage, so Capy's servers can identify it. **There is a risk of being flagged as a non-official client and banned, especially on free quotas.**
 >
 > Capability matrix (these capabilities all live on the local device — holding the device token means holding them):
